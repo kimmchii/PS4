@@ -30,7 +30,7 @@ whisper_model_path: /mnt/data/models/asr/whisper/based/whisper-large-v3
 # Every language present in the training data needs an entry.
 #   en (CHiME6 / AMI)          → voxceleb_resnet34_LM
 #   zh (AliMeeting / AISHELL-4) → cnceleb_resnet34_LM
-#   th (ThaiDummy)              → TidyVoice SimAM-ResNet34 (cross-lingual; no Thai-specific
+#   th (ThaiSim)                → TidyVoice SimAM-ResNet34 (cross-lingual; no Thai-specific
 #                                 model exists yet). From areffarhadi/Resnet34-tidyvoiceX-ASV:
 #                                 move models/avg_model.pt next to config.yaml.
 # (Legacy spk_encoder_en_path / spk_encoder_chs_path keys are still accepted.)
@@ -88,8 +88,11 @@ data:
   #       - /path/to/aug_data
   #
   # Backward-compatible: train_root: <single path> is equivalent to train_roots: [<path>]
+  # Every dataset below is looked up in every root; one that is missing under a root
+  # is skipped with a warning (REAL-PS4-mini has no ThaiSim, tse_test has only ThaiSim).
   train_roots:
     - /mnt/data/audios/REAL-PS4-mini
+    - /mnt/data/speakers/tse_test      # simulated Thai mixtures (prepare_tse_data.py)
     # - /path/to/aug_data
 
   # Enabled datasets (comment out to skip)
@@ -98,7 +101,7 @@ data:
     - AMI
     - AliMeeting
     - AISHELL-4
-    - ThaiDummy      # placeholder Thai dataset (see dataset_subdirs / dataset_langs below)
+    - ThaiSim        # simulated Thai mixtures (see dataset_subdirs / dataset_langs below)
 
   # Dataset subdirectories relative to each root in train_roots
   # Each dataset directory contains: mapping.csv, TRAIN/, enrolment_speakers/
@@ -114,9 +117,9 @@ data:
   # The meta CSV "language" column wins over dataset_langs when present.
   # If a listed dataset's folder is missing under a root, it is skipped with a warning.
   dataset_subdirs:
-    ThaiDummy: ThaiDummy          # <root>/ThaiDummy/..., meta file TRAIN/ThaiDummy_meta.csv
+    ThaiSim: ThaiSim              # <root>/ThaiSim/..., meta file TRAIN/ThaiSim_meta.csv
   dataset_langs:
-    ThaiDummy: th                 # Whisper token <|th|>, speaker encoder spk_encoders.th
+    ThaiSim: th                   # Whisper token <|th|>, speaker encoder spk_encoders.th
 
   # Audio parameters
   sample_rate: 16000
