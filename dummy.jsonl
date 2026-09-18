@@ -1,0 +1,4 @@
+{"audio_path": "/mnt/data/speakers/samples/a.wav", "speaker_id": "speaker_a", "text": "hello"}
+{"audio_path": "/mnt/data/speakers/samples/a2.wav", "speaker_id": "speaker_a", "text": "good"}
+{"audio_path": "/mnt/data/speakers/samples/b.wav", "speaker_id": "B", "text": "Eazy"}
+{"audio_path": "/mnt/data/speakers/samples/c.wav", "speaker_id": "some_dude", "text": "Help me"}
