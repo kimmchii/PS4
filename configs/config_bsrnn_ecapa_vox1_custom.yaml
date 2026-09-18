@@ -125,7 +125,7 @@ data:
 
   # Maximum mixture length in samples (samples exceeding this are skipped at load time)
   # Whisper processes at most 30 s (480,000 samples @ 16 kHz)
-  max_mix_len: 480000     # 30 s @ 16 kHz
+  max_mix_len: 160000     # 10 s @ 16 kHz (longer clips run out of memory on an 8 GB GPU)
 
   # Maximum enrollment truncation length in samples (0 = no truncation)
   max_enroll_len: 160000  # 10 s
