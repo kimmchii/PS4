@@ -123,8 +123,9 @@ Edit [`configs/config_bsrnn_ecapa_vox1.yaml`](configs/config_bsrnn_ecapa_vox1.ya
 ```yaml
 pretrained_tse: /path/to/bsrnn_ecapa_vox1/avg_model.pt   # pretrained TSE backbone
 whisper_model_path: /path/to/whisper-large-v3             # Whisper ASR model
-spk_encoder_en_path:  /path/to/voxceleb_resnet34_LM       # EN speaker encoder
-spk_encoder_chs_path: /path/to/cnceleb_resnet34_LM        # ZH speaker encoder
+spk_encoders:                                             # speaker encoder per language
+  en: /path/to/voxceleb_resnet34_LM
+  zh: /path/to/cnceleb_resnet34_LM
 dnsmos_model_dir: /path/to/DNSMOS                         # DNSMOS ONNX models
 
 data:

@@ -9,8 +9,10 @@ seed: 42
 
 # ── Device and precision ──────────────────────────────────────
 device: cuda
-enable_amp: false         # Disable mixed precision; use fp32 throughout (LSTM cuDNN does not support bf16)
-amp_dtype: float32
+enable_amp: false         # Mixed precision for the TSE forward pass only (Whisper, speaker encoders and DNSMOS stay fp32)
+amp_dtype: float32        # bfloat16 (bf16) | float16 (fp16, uses loss scaling) | float32 (fp32 = AMP off)
+                          # bfloat16 is recommended when enabling AMP; the BSRNN LSTMs run fine in bf16
+                          # with recent cuDNN (tested: torch 2.10, cuDNN 9.10), roughly halving TSE activation memory
 
 # ── Experiment output directory ───────────────────────────────
 exp_dir: exp/bsrnn_ecapa_vox1
@@ -22,11 +24,17 @@ pretrained_tse: /path/to/pretrained/bsrnn_ecapa_vox1/avg_model.pt
 # ASR proxy model: Whisper large-v3
 whisper_model_path: /path/to/whisper-large-v3
 
-# Speaker encoders — ResNet34-LM, identical to the evaluation-side wespeakerruntime
-#   English datasets (CHiME6 / AMI)          → voxceleb_resnet34_LM
-#   Chinese datasets (AliMeeting / AISHELL-4) → cnceleb_resnet34_LM
-spk_encoder_en_path:  /path/to/spk_emb_models/voxceleb_resnet34_LM
-spk_encoder_chs_path: /path/to/spk_emb_models/cnceleb_resnet34_LM
+# Speaker encoders for the similarity loss, keyed by language code (Whisper codes).
+# Each must be a wespeaker model dir (config.yaml + avg_model.pt) and should be the
+# same model the evaluation side uses for that language.
+# Every language present in the training data needs an entry.
+#   en (CHiME6 / AMI)          → voxceleb_resnet34_LM
+#   zh (AliMeeting / AISHELL-4) → cnceleb_resnet34_LM
+# (Legacy spk_encoder_en_path / spk_encoder_chs_path keys are still accepted.)
+spk_encoders:
+  en: /path/to/spk_emb_models/voxceleb_resnet34_LM
+  zh: /path/to/spk_emb_models/cnceleb_resnet34_LM
+  # th: /path/to/spk_emb_models/<thai_model>
 
 # Resume from checkpoint (null = start from pretrained_tse)
 resume: null
@@ -95,8 +103,20 @@ data:
   alimeeting_subdir: AliMeeting
   aishell4_subdir:   AISHELL-4
 
+  # Extra datasets (e.g. Thai): list the name under `datasets`, then optionally
+  # set its subdirectory and language. The layout must match REAL-PS4:
+  #   <subdir>/mapping.csv, <subdir>/mixtures/, <subdir>/enrolment_speakers/,
+  #   <subdir>/TRAIN/<name>_meta.csv, <subdir>/TRAIN/target_activity_segments.jsonl
+  # The meta CSV "language" column wins over dataset_langs when present.
+  # dataset_subdirs:
+  #   ThaiMeeting: ThaiMeeting
+  # dataset_langs:
+  #   ThaiMeeting: th
+
   # Audio parameters
   sample_rate: 16000
+  # Peak-normalize mixture and enrollment to [-1, 1] (matches inference.py)
+  peak_normalize: true
 
   # Maximum mixture length in samples (samples exceeding this are skipped at load time)
   # Whisper processes at most 30 s (480,000 samples @ 16 kHz)
@@ -162,18 +182,22 @@ sim_margin: 0.2        # Ranking loss hinge margin
 # ── Differentiable DNSMOS Loss ────────────────────────────────
 # Uses the same ONNX model as the evaluation pipeline to directly optimize the eval metric.
 # No reference audio required; the ref argument is interface-only and not used in computation.
-# ONNX models (sig_bak_ovr.onnx, model_v8.onnx) should be placed in dnsmos_model_dir.
+# dnsmos_model_dir must contain sig_bak_ovr.pt and model_v8.pt (PyTorch/TorchScript conversions
+# of the official DNSMOS ONNX models); the .onnx files themselves are not loaded.
 lambda_dnsmos: 0.3          # DNSMOS loss weight (set to 0 to disable)
 dnsmos_model_dir: /path/to/DNSMOS
 dnsmos_target: OVRL         # Optimization target: OVRL | SIG | BAK | P808
 
 # ── Target Speaker VAD Loss parameters ───────────────────────
-# VAD loss supervises the frame-level energy of the TSE output:
-#   - Frames where the target speaker is active  → output should have high energy
+# VAD loss supervises the frame-level level of the TSE output, measured in dB
+# relative to the loudest frame of the mixture (independent of recording level):
+#   - Frames where the target speaker is active  → output should be above the threshold
 #   - Frames where the target speaker is silent  → output should be near silence
 # Labels are loaded from TRAIN/target_activity_segments.jsonl in each dataset
 vad_frame_shift_ms:  10.0    # Frame shift in milliseconds (must match VAD label alignment)
 vad_frame_length_ms: 25.0    # Frame length in milliseconds
+vad_threshold_db:   -40.0    # Level (dB re. mixture peak frame) mapped to activity probability 0.5
+vad_slope_db:         5.0    # dB per logit unit; smaller = sharper active/silent decision
 
 # Legacy compatibility: lambda_spk > 0 is equivalent to combined mode with lambda_sim = lambda_spk
 # New training runs should use loss_mode + lambda_sim directly; this field can be ignored.

@@ -19,7 +19,9 @@ Key config fields (YAML):
   lambda_vad  : Target speaker VAD loss weight      (default 0.5)
   sim_margin  : ranking margin                      (default 0.2)
   vad_frame_shift_ms : VAD frame shift (ms)         (default 10)
-  spk_encoder_path : Speaker encoder model dir or weights (required for similarity/combined)
+  spk_encoders : language -> speaker encoder dir, e.g. {en: ..., zh: ..., th: ...}
+                 (required for similarity/combined; legacy spk_encoder_en_path /
+                 spk_encoder_chs_path still work)
 
 Single GPU:
     python train.py --config configs/config_bsrnn_ecapa_vox1.yaml
@@ -113,7 +115,7 @@ class DNSMOSLoss(nn.Module):
         self.target_metric = target_metric
         self._len_samples = int(self._INPUT_LEN * self._SR)
 
-        # 加载预转换的 PyTorch 模型（torch.save 保存的完整模型对象）
+        # Load the pre-converted PyTorch / TorchScript model (full model object)
         self.primary_model = torch.load(primary_model_path, weights_only=False)
         self.primary_model.eval()
         self.p808_model = torch.load(p808_model_path, weights_only=False)
@@ -141,9 +143,9 @@ class DNSMOSLoss(nn.Module):
         return mel_db
 
     def _score_one(self, audio: torch.Tensor) -> torch.Tensor:
-        """audio: (T,) → scalar DNSMOS score（可微分）"""
+        """audio: (T,) → scalar DNSMOS score (differentiable)"""
         import math
-        # 短音频重复填充到至少 9.01s
+        # Repeat-pad short audio to at least 9.01 s
         while audio.shape[0] < self._len_samples:
             audio = torch.cat([audio, audio], dim=0)
 
@@ -180,8 +182,8 @@ class DNSMOSLoss(nn.Module):
 
     def forward(self, inf: torch.Tensor, ref: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
-        inf: (B, T)  TSE 输出（ref 不参与计算，可不传）
-        返回: (B,) 负 DNSMOS 分数（minimize = maximize DNSMOS）
+        inf: (B, T)  TSE output (ref is not used and may be omitted)
+        Returns: (B,) negative DNSMOS score (minimize = maximize DNSMOS)
         """
         if inf.dim() == 3:
             inf = inf[:, 0, :]
@@ -191,40 +193,78 @@ class DNSMOSLoss(nn.Module):
         return torch.stack(losses)
 
 
-_DNSMOS_LOSS_AVAILABLE = True   # 自包含实现，无外部依赖
+_DNSMOS_LOSS_AVAILABLE = True   # self-contained implementation, no external dependencies
 
 
 # ===========================================================================
-# 数据集
+# Dataset
 # ===========================================================================
 
-# 数据集语言映射（每个数据集的音频语言）
-DATASET_LANG: Dict[str, str] = {
-    "CHiME6":    "en",
-    "AMI":       "en",
-    "DipCo":     "en",
-    "AliMeeting": "zh",
-    "AISHELL-4": "zh",
+# Built-in datasets: name -> (data config key holding its subdirectory, language).
+# Any other dataset can be listed in data.datasets; its subdirectory defaults to
+# its name (override via data.dataset_subdirs) and its language comes from the
+# meta CSV "language" column or data.dataset_langs.
+# Every dataset uses TRAIN/<name>_meta.csv and TRAIN/target_activity_segments.jsonl.
+BUILTIN_DATASETS: Dict[str, Tuple[str, str]] = {
+    "CHiME6":     ("chime6_subdir",     "en"),
+    "AMI":        ("ami_subdir",        "en"),
+    "DipCo":      ("dipco_subdir",      "en"),
+    "AliMeeting": ("alimeeting_subdir", "zh"),
+    "AISHELL-4":  ("aishell4_subdir",   "zh"),
 }
+
+# Language codes follow Whisper (en / zh / th ...); map common aliases onto them.
+LANG_ALIASES: Dict[str, str] = {"chs": "zh", "cn": "zh", "cmn": "zh", "tha": "th", "eng": "en"}
+
+
+def normalize_lang(lang) -> Optional[str]:
+    if lang is None or (isinstance(lang, float) and pd.isna(lang)):
+        return None
+    lang = str(lang).strip().lower()
+    if not lang:
+        return None
+    return LANG_ALIASES.get(lang, lang)
+
+
+def dataset_subdir(ds_name: str, data_cfg: Dict) -> str:
+    """Subdirectory of a dataset relative to each train root."""
+    builtin = BUILTIN_DATASETS.get(ds_name)
+    if builtin is not None and data_cfg.get(builtin[0]):
+        return data_cfg[builtin[0]]
+    return (data_cfg.get("dataset_subdirs") or {}).get(ds_name, ds_name)
+
+
+def dataset_lang(ds_name: str, data_cfg: Dict) -> Optional[str]:
+    """Dataset-level language: data.dataset_langs overrides the built-in value."""
+    configured = (data_cfg.get("dataset_langs") or {}).get(ds_name)
+    if configured is not None:
+        return normalize_lang(configured)
+    builtin = BUILTIN_DATASETS.get(ds_name)
+    return builtin[1] if builtin is not None else None
+
+
+def _peak_normalize(wav: torch.Tensor) -> torch.Tensor:
+    peak = wav.abs().max()
+    return wav / peak if peak > 0 else wav
 
 
 class TSEASRDataset(Dataset):
     """
-    TSE-ASR 训练数据集
+    TSE-ASR training dataset
 
-    每个样本包含:
-      - mixture_wav:  混合音频 (多说话人)，Tensor [T]
-      - enroll_wav:   目标说话人注册音频，Tensor [T_e]
-      - transcript:   目标说话人转录文本，str
-      - language:     音频语言，'zh' 或 'en'
+    Each sample contains:
+        - mixture_wav:  multi-speaker mixture, Tensor [T]
+        - enroll_wav:   target speaker enrollment audio, Tensor [T_e]
+        - transcript:   target speaker transcript, str
+        - language:     audio language code, e.g. 'zh' / 'en' / 'th'
 
-    数据来源: 4 个数据集，每个数据集包含:
-      - mapping.csv:   utterance -> wav 路径
+    Data source: each dataset directory contains:
+        - mapping.csv:   utterance -> wav path
       - TRAIN/*_meta.csv: mixture_utterance, enrolment_speakers_utterance, transcript
 
-    支持通过 train_roots（列表）指定多个数据根目录（如原始数据 + 增强数据），
-    各根目录使用相同的 datasets 和 dataset_subdirs 配置，数据会合并加载。
-    也可单独指定 aug_data 作为唯一根目录。
+    Multiple data roots can be given via train_roots (e.g. original + augmented data);
+    every root uses the same datasets / dataset_subdirs config and the data is merged.
+    A single root (e.g. only augmented data) also works.
     """
 
     def __init__(
@@ -238,9 +278,11 @@ class TSEASRDataset(Dataset):
         min_transcript_len: int = 2,
         max_samples: int = 0,
         load_vad_labels: bool = True,
+        peak_normalize: bool = True,
     ):
         super().__init__()
         self.sample_rate = sample_rate
+        self.peak_normalize = peak_normalize
         self.max_mix_len = max_mix_len
         self.max_enroll_len = max_enroll_len
         self.min_transcript_len = min_transcript_len
@@ -265,21 +307,12 @@ class TSEASRDataset(Dataset):
         dataset_subdirs: Dict[str, str],
     ) -> Dict[str, List[List[float]]]:
         """
-        加载所有数据集的 target_activity_segments.jsonl，建立
-        (mixture_utterance, speaker) -> segments 的索引。
+        Load target_activity_segments.jsonl of every dataset and build a
+        (mixture_utterance, speaker) -> segments index.
         """
-        dataset_key_map = {
-            "CHiME6":     "chime6_subdir",
-            "AMI":        "ami_subdir",
-            "AliMeeting":  "alimeeting_subdir",
-            "AISHELL-4":  "aishell4_subdir",
-        }
-        vad_index: Dict[str, List[List[float]]] = {}
+        vad_index: Dict[Tuple[str, str], List[List[float]]] = {}
         for ds_name in datasets:
-            subdir_key = dataset_key_map.get(ds_name)
-            if subdir_key is None:
-                continue
-            subdir = dataset_subdirs.get(subdir_key, ds_name)
+            subdir = dataset_subdir(ds_name, dataset_subdirs)
             vad_file = Path(train_root) / subdir / "TRAIN" / "target_activity_segments.jsonl"
             if not vad_file.exists():
                 logging.warning(f"[Dataset] VAD 标签文件不存在: {vad_file}")
@@ -303,36 +336,19 @@ class TSEASRDataset(Dataset):
         datasets: List[str],
         dataset_subdirs: Dict[str, str],
     ):
-        """从各数据集的 mapping.csv + meta.csv 中加载样本"""
-        dataset_key_map = {
-            "CHiME6":     "chime6_subdir",
-            "AMI":        "ami_subdir",
-            "AliMeeting":  "alimeeting_subdir",
-            "AISHELL-4":  "aishell4_subdir",
-        }
-        meta_file_map = {
-            "CHiME6":     "CHiME6_meta.csv",
-            "AMI":        "AMI_meta.csv",
-            "AliMeeting":  "AliMeeting_meta.csv",
-            "AISHELL-4":  "AISHELL-4_meta.csv",
-        }
+        """Load samples from each dataset's mapping.csv + meta.csv"""
 
-        # 加载 VAD 标签索引
-        vad_index: Dict[str, List[List[float]]] = {}
+        # Load the VAD label index
+        vad_index: Dict[Tuple[str, str], List[List[float]]] = {}
         if self.load_vad_labels:
             vad_index = self._load_vad_index(train_root, datasets, dataset_subdirs)
 
         for ds_name in datasets:
-            subdir_key = dataset_key_map.get(ds_name)
-            if subdir_key is None:
-                logging.warning(f"[Dataset] 未知数据集名 {ds_name}，跳过")
-                continue
-
-            subdir = dataset_subdirs.get(subdir_key, ds_name)
+            subdir = dataset_subdir(ds_name, dataset_subdirs)
             ds_root = Path(train_root) / subdir
 
             mapping_csv = ds_root / "mapping.csv"
-            meta_csv    = ds_root / "TRAIN" / meta_file_map[ds_name]
+            meta_csv    = ds_root / "TRAIN" / f"{ds_name}_meta.csv"
 
             if not mapping_csv.exists():
                 logging.warning(f"[Dataset] mapping.csv 不存在: {mapping_csv}，跳过")
@@ -341,65 +357,94 @@ class TSEASRDataset(Dataset):
                 logging.warning(f"[Dataset] meta.csv 不存在: {meta_csv}，跳过")
                 continue
 
-            # 加载路径映射（仅包含 mixture 音频）
+            # Load the path mapping (mixture audio only)
             mapping_df = pd.read_csv(mapping_csv)
             utterance_map: Dict[str, str] = (
                 mapping_df.set_index("utterance")["path"].to_dict()
             )
 
-            # 注册音频目录：enrolment_speakers/{utterance}.wav
+            # Enrollment audio directory: enrolment_speakers/{utterance}.wav
             enroll_dir = ds_root / "enrolment_speakers"
+            mix_dir    = ds_root / "mixtures"
+            path_cache: Dict[Tuple[str, Path], Optional[str]] = {}
 
-            # 加载 meta
+            def local_wav(utt: str, fallback_dir: Path) -> Optional[str]:
+                """
+                Resolve an utterance to a wav that exists on this machine, or None.
+                mapping.csv may hold absolute paths from another machine (e.g. the
+                published REAL-PS4 data), so fall back to <fallback_dir>/<file name>.
+                Rows whose audio is missing are skipped, which also allows training
+                on a partial download.
+                """
+                key = (utt, fallback_dir)
+                if key not in path_cache:
+                    mapped = utterance_map.get(utt)
+                    name = os.path.basename(mapped) if mapped is not None else f"{utt}.wav"
+                    found = None
+                    for cand in ([mapped] if mapped is not None else []) + [str(fallback_dir / name)]:
+                        if os.path.exists(cand):
+                            found = cand
+                            break
+                    path_cache[key] = found
+                return path_cache[key]
+
+            # Load meta
             meta_df = pd.read_csv(meta_csv)
 
-            ds_lang = DATASET_LANG.get(ds_name)  # 该数据集的语言
-            if ds_lang is None:
+            # Per-row "language" column wins; the dataset-level language is the fallback
+            ds_lang = dataset_lang(ds_name, dataset_subdirs)
+            has_lang_col = "language" in meta_df.columns
+            if ds_lang is None and not has_lang_col:
                 logging.warning(
-                    f"[Dataset] 数据集 {ds_name} 未在 DATASET_LANG 中配置语言，"
-                    f"跳过该数据集（请在 DATASET_LANG 中添加对应语言映射）"
+                    f"[Dataset] {ds_name}: no language known (add a 'language' column to "
+                    f"the meta CSV or set data.dataset_langs.{ds_name}), skipping dataset"
                 )
                 continue
-            cnt_ok = cnt_skip = 0
+            cnt_ok = cnt_skip = cnt_missing = 0
             for _, row in meta_df.iterrows():
                 mix_utt    = row["mixture_utterance"]
                 enroll_utt = row["enrolment_speakers_utterance"]
                 speaker    = row.get("speaker", "")
-                # 列名可能是 "transcript" 或 "ground_truth_transcript"
-                transcript = str(
-                    row.get("transcript", row.get("ground_truth_transcript", ""))
-                ).strip()
+                # The column may be named "transcript" or "ground_truth_transcript"
+                raw_text = row.get("transcript", row.get("ground_truth_transcript", ""))
+                # pandas reads empty cells as NaN; str(NaN) == "nan" would pass the length filter
+                transcript = "" if pd.isna(raw_text) else str(raw_text).strip()
 
-                # 过滤短文本
+                # Filter out short transcripts
                 if len(transcript) < self.min_transcript_len:
                     cnt_skip += 1
                     continue
 
-                mix_path = utterance_map.get(mix_utt)
+                mix_path = local_wav(mix_utt, mix_dir)
 
-                # 注册音频：优先从 mapping.csv 查，找不到则直接拼接目录路径
-                enroll_path = utterance_map.get(enroll_utt)
-                if enroll_path is None:
-                    candidate = enroll_dir / (enroll_utt + ".wav")
-                    if candidate.exists():
-                        enroll_path = str(candidate)
+                # Enrollment audio: look up mapping.csv first, else <enrolment_speakers>/<utt>.wav
+                enroll_path = local_wav(enroll_utt, enroll_dir)
 
                 if mix_path is None or enroll_path is None:
+                    cnt_missing += 1
+                    continue
+
+                # VAD segments (may be None; the VAD loss then skips this sample)
+                vad_segments = vad_index.get((mix_utt, speaker), None)
+
+                lang = (normalize_lang(row["language"]) if has_lang_col else None) or ds_lang
+                if lang is None:
                     cnt_skip += 1
                     continue
 
-                # 获取 VAD segments（可能为 None，训练时跳过 VAD loss）
-                vad_segments = vad_index.get((mix_utt, speaker), None)
-
-                self.samples.append((mix_path, enroll_path, transcript, ds_lang, vad_segments))
+                self.samples.append((mix_path, enroll_path, transcript, lang, vad_segments))
                 cnt_ok += 1
 
             logging.info(
-                f"[Dataset] {ds_name}: 加载 {cnt_ok} 条，跳过 {cnt_skip} 条"
+                f"[Dataset] {ds_name}: 加载 {cnt_ok} 条，跳过 {cnt_skip} 条, "
+                f"missing audio {cnt_missing}"
             )
 
     def __len__(self) -> int:
         return len(self.samples)
+
+    def languages(self) -> List[str]:
+        return sorted({s[3] for s in self.samples})
 
     def __getitem__(self, idx: int) -> Optional[Dict]:
         mix_path, enroll_path, transcript, language, vad_segments = self.samples[idx]
@@ -411,13 +456,13 @@ class TSEASRDataset(Dataset):
             logging.warning(f"[Dataset] 音频加载失败 idx={idx}: {e}")
             return None
 
-        # 转换采样率
+        # Resample
         if sr_m != self.sample_rate:
             mix_wav = torchaudio.functional.resample(mix_wav, sr_m, self.sample_rate)
         if sr_e != self.sample_rate:
             enroll_wav = torchaudio.functional.resample(enroll_wav, sr_e, self.sample_rate)
 
-        # 单声道
+        # Downmix to mono
         if mix_wav.shape[0] > 1:
             mix_wav = mix_wav.mean(0, keepdim=True)
         if enroll_wav.shape[0] > 1:
@@ -426,11 +471,17 @@ class TSEASRDataset(Dataset):
         mix_wav    = mix_wav.squeeze(0)      # [T]
         enroll_wav = enroll_wav.squeeze(0)   # [T_e]
 
-        # 过滤超长 mixture
+        # Peak-normalize to [-1, 1], same as inference.py's load_audio, so the
+        # level-sensitive losses (VAD, DNSMOS) see the levels used at inference.
+        if self.peak_normalize:
+            mix_wav    = _peak_normalize(mix_wav)
+            enroll_wav = _peak_normalize(enroll_wav)
+
+        # Drop over-long mixtures
         if self.max_mix_len > 0 and mix_wav.shape[0] > self.max_mix_len:
             return None
 
-        # 截断过长的 enrollment
+        # Truncate over-long enrollments
         if self.max_enroll_len > 0 and enroll_wav.shape[0] > self.max_enroll_len:
             enroll_wav = enroll_wav[: self.max_enroll_len]
 
@@ -438,21 +489,21 @@ class TSEASRDataset(Dataset):
             "mixture":      mix_wav,        # [T]
             "enroll":       enroll_wav,     # [T_e]
             "transcript":   transcript,     # str
-            "language":     language,       # 'zh' 或 'en'
-            "vad_segments": vad_segments,   # List[[start, end]] 或 None
+            "language":     language,       # language code, e.g. 'zh' / 'en' / 'th'
+            "vad_segments": vad_segments,   # List[[start, end]] or None
         }
 
 
 def tse_asr_collate_fn(batch: List) -> Optional[Dict]:
     """
-    对齐并组装 batch，过滤掉 None 样本。
-    返回:
+    Pad and assemble a batch, dropping None samples.
+    Returns:
         mixture:  [B, T_max]  (zero-padded)
         enroll:   [B, T_e_max]
-        mix_lens: [B]  实际长度（采样点数）
+            mix_lens: [B]  real lengths (samples)
         transcripts: List[str]
-        languages:   List[str]  每条样本的语言 ('zh'/'en')
-        vad_segments: List[Optional[List[[start, end]]]]  目标说话人 VAD 标签
+            languages:   List[str]  language of each sample
+            vad_segments: List[Optional[List[[start, end]]]]  target speaker VAD labels
     """
     batch = [b for b in batch if b is not None]
     if len(batch) == 0:
@@ -461,7 +512,7 @@ def tse_asr_collate_fn(batch: List) -> Optional[Dict]:
     mix_wavs      = [b["mixture"]    for b in batch]
     enroll_wavs   = [b["enroll"]     for b in batch]
     transcripts   = [b["transcript"] for b in batch]
-    languages     = [b["language"] for b in batch]   # 每条样本必须有 language 字段
+    languages     = [b["language"] for b in batch]   # every sample must have a language field
     vad_segments  = [b.get("vad_segments", None) for b in batch]
 
     mix_lens    = torch.tensor([w.shape[0] for w in mix_wavs], dtype=torch.long)
@@ -476,30 +527,30 @@ def tse_asr_collate_fn(batch: List) -> Optional[Dict]:
         "mix_lens":     mix_lens,      # [B]
         "enroll_lens":  enroll_lens,   # [B]
         "transcripts":  transcripts,   # List[str]
-        "languages":    languages,     # List[str]，每条样本的语言
+        "languages":    languages,     # List[str], language of each sample
         "vad_segments": vad_segments,  # List[Optional[List[[start,end]]]]
     }
 
 
 # ===========================================================================
-# TSE 模型加载
+# TSE model loading
 # ===========================================================================
 
 def build_tse_model(cfg: Dict, pretrained_path: Optional[str] = None) -> nn.Module:
     """
-    根据 config 构建 TSE 模型并加载预训练权重。
+    Build the TSE model from the config and load pretrained weights.
 
-    支持:
-      - BSRNN          (bsrnn_legacy.py 中的旧版 BSRNN，通过 wesep 的 legacy 路径)
-      - TSE_BSRNN_SPK  (wesep_real_tse 新版联合模型)
-      - TFGridNet      (如有)
+    Supports:
+        - BSRNN          (legacy BSRNN in bsrnn_legacy.py, via wesep's legacy path)
+        - TSE_BSRNN_SPK  (newer joint model in wesep_real_tse; not bundled in wesep_ps4)
+        - TFGridNet      (if available; not bundled in wesep_ps4)
     """
     from wesep.models import get_model
 
     model_name = cfg["model"]["tse_model"]
-    model_args = dict(cfg["model_args"]["tse_model"])  # 浅拷贝，避免修改原 cfg
+    model_args = dict(cfg["model_args"]["tse_model"])  # shallow copy so the original cfg is not modified
 
-    # 将 spk_model_init 中的相对路径解析为绝对路径
+    # Resolve a relative spk_model_init path to an absolute path
     if "spk_model_init" in model_args and model_args["spk_model_init"]:
         smi = model_args["spk_model_init"]
         if not os.path.isabs(smi):
@@ -508,14 +559,14 @@ def build_tse_model(cfg: Dict, pretrained_path: Optional[str] = None) -> nn.Modu
             logging.info(f"[TSE] spk_model_init 解析为: {smi_abs}")
 
     model_cls = get_model(model_name)
-    model = model_cls(**model_args)  # 展开 dict 为关键字参数
+    model = model_cls(**model_args)  # unpack the dict as keyword arguments
 
     if pretrained_path is not None and pretrained_path != "null":
         pretrained_path = str(Path(_SCRIPT_DIR) / pretrained_path)
         logging.info(f"[TSE] 从预训练权重加载: {pretrained_path}")
         ckpt = torch.load(pretrained_path, map_location="cpu")
-        # 兼容多种 checkpoint 格式
-        # wesep 训练保存格式：{"models": [state_dict], "optimizers": [...], ...}
+        # Support several checkpoint formats
+        # wesep training format: {"models": [state_dict], "optimizers": [...], ...}
         if isinstance(ckpt, dict) and "models" in ckpt:
             models_val = ckpt["models"]
             if isinstance(models_val, list) and len(models_val) > 0:
@@ -536,24 +587,24 @@ def build_tse_model(cfg: Dict, pretrained_path: Optional[str] = None) -> nn.Modu
 
 
 # ===========================================================================
-# ASR 模型 (Whisper，冻结)
+# ASR model (Whisper, frozen)
 # ===========================================================================
 
 class FrozenWhisperASR(nn.Module):
     """
-    封装冻结的 Whisper ASR 模型（使用 HuggingFace transformers）。
-    用于从 TSE 输出音频中提取文字级别的 cross-entropy loss。
+    Frozen Whisper ASR model (HuggingFace transformers).
+    Computes a token-level cross-entropy loss on the TSE output audio.
 
-    前向输入: 已提取的音频波形 (float32, 16kHz)
-    前向输出: CE loss scalar（可反向传播到 TSE 模型）
+    Forward input:  extracted waveform (float32, 16 kHz)
+    Forward output: CE loss scalar (backpropagates into the TSE model)
 
-    梯度路径: tse_wav -> STFT -> mel filterbank -> log_mel -> encoder -> decoder -> CE loss
+    Gradient path: tse_wav -> STFT -> mel filterbank -> log_mel -> encoder -> decoder -> CE loss
     """
 
-    # Whisper 固定参数
+    # Whisper constants
     N_FFT     = 400
     HOP       = 160
-    N_MELS    = 128   # large-v3 使用 128 mel bins
+    N_MELS    = 128   # large-v3 uses 128 mel bins
     MAX_FRAME = 3000  # 30s at 10ms shift，16kHz
     SAMPLE_RATE = 16000
 
@@ -567,16 +618,16 @@ class FrozenWhisperASR(nn.Module):
             dtype=torch.float32,
         )
 
-        # 冻结所有参数
+        # Freeze all parameters
         for p in self.hf_model.parameters():
             p.requires_grad_(False)
         self.hf_model.eval()
 
-        # 加载 tokenizer
+        # Load the tokenizer
         self.tokenizer = WhisperTokenizer.from_pretrained(model_path)
 
-        # 预计算 mel 滤波器（固定矩阵，不需要梯度）
-        # 使用 torchaudio 的 mel_scale_fbanks
+        # Precompute the mel filterbank (fixed matrix, no gradient)
+        # using torchaudio's melscale_fbanks
         mel_fb = torchaudio.functional.melscale_fbanks(
             n_freqs=self.N_FFT // 2 + 1,
             f_min=0.0,
@@ -586,20 +637,37 @@ class FrozenWhisperASR(nn.Module):
             norm="slaney",
             mel_scale="slaney",
         )  # [n_freqs, n_mels]
-        self.register_buffer("mel_fb", mel_fb)  # 不参与梯度，跟随 .to(device) 移动
+        self.register_buffer("mel_fb", mel_fb)  # no gradient; moves with .to(device)
 
         logging.info(f"[ASR] Whisper 参数已冻结，mel_bins={self.N_MELS}")
 
+    def check_languages(self, languages: List[str]):
+        """Fail early if a language has no Whisper token (it would silently map to <unk>)."""
+        unk = self.tokenizer.unk_token_id
+        bad = [l for l in languages
+               if self.tokenizer.convert_tokens_to_ids(f"<|{l}|>") in (None, unk)]
+        if bad:
+            raise ValueError(f"[ASR] Whisper has no language token for {bad}")
+
     def _compute_mel_with_grad(self, wav: torch.Tensor) -> torch.Tensor:
         """
-        计算可微分的 log-mel spectrogram（全部 PyTorch 操作，梯度可回传）。
-        与 WhisperFeatureExtractor 的结果保持一致。
+        Differentiable log-mel spectrogram (pure PyTorch, gradients flow back).
+        Matches WhisperFeatureExtractor.
 
-        输入: wav [T]，float32，16kHz
-        输出: log_mel [1, N_MELS, MAX_FRAME]
+        Input:  wav [T], float32, 16 kHz
+        Output: log_mel [1, N_MELS, MAX_FRAME]
         """
         device = wav.device
         window = torch.hann_window(self.N_FFT, device=device)
+
+        # Match WhisperFeatureExtractor: zero-pad the *waveform* to 30 s before the
+        # STFT (padding the normalized log-mel with 0 would look like loud speech),
+        # then drop the last STFT frame to get exactly MAX_FRAME frames.
+        n_samples = self.MAX_FRAME * self.HOP
+        if wav.shape[0] < n_samples:
+            wav = F.pad(wav, (0, n_samples - wav.shape[0]))
+        else:
+            wav = wav[:n_samples]
 
         stft = torch.stft(
             wav,
@@ -607,24 +675,17 @@ class FrozenWhisperASR(nn.Module):
             hop_length=self.HOP,
             window=window,
             return_complex=True,
-        )  # [F, T_stft]，F = N_FFT/2+1
+        )  # [F, MAX_FRAME + 1]，F = N_FFT/2+1
 
-        magnitudes = stft.abs() ** 2  # power spectrum [F, T_stft]
+        magnitudes = stft[..., :-1].abs() ** 2  # power spectrum [F, MAX_FRAME]
 
         # mel_fb: [F, N_MELS]，magnitudes: [F, T_stft]
         mel_spec = self.mel_fb.T @ magnitudes   # [N_MELS, T_stft]
 
-        # log 压缩（与 WhisperFeatureExtractor 一致：log10 + 归一化）
+        # Log compression (same as WhisperFeatureExtractor: log10 + normalization)
         log_mel = (mel_spec.clamp(min=1e-10)).log10()
         log_mel = torch.maximum(log_mel, log_mel.max() - 8.0)
         log_mel = (log_mel + 4.0) / 4.0
-
-        # Pad / trim 到 MAX_FRAME
-        T = log_mel.shape[-1]
-        if T < self.MAX_FRAME:
-            log_mel = F.pad(log_mel, (0, self.MAX_FRAME - T))
-        else:
-            log_mel = log_mel[:, :self.MAX_FRAME]
 
         return log_mel.unsqueeze(0)  # [1, N_MELS, MAX_FRAME]
 
@@ -632,32 +693,32 @@ class FrozenWhisperASR(nn.Module):
         self,
         audio: torch.Tensor,                    # [B, T]，float32，16kHz
         transcripts: List[str],
-        language: Optional[str] = None,         # 全局默认语言（None=逐样本使用 languages）
-        languages: Optional[List[str]] = None,  # 每条样本的语言列表（优先级高于 language）
+        language: Optional[str] = None,         # global default language (None = use per-sample languages)
+        languages: Optional[List[str]] = None,  # per-sample languages (takes precedence over language)
     ) -> torch.Tensor:
         """
         Teacher-forcing CE loss。
 
-        参数:
-            audio:       TSE 输出的单通道音频 [B, T]
-            transcripts: 目标文本列表，长度 B
-            language:    全局解码语言，'zh' / 'en'（当 languages 为 None 时使用）
-            languages:   每条样本的语言列表（优先使用，修复混合语言 batch 的问题）
+        Args:
+                audio:       mono TSE output audio [B, T]
+                transcripts: target transcripts, length B
+                language:    global language code, used when languages is None
+                languages:   per-sample language codes (takes precedence; handles mixed-language batches)
 
-        返回:
-            loss: scalar Tensor（CE loss，可反向传播到 TSE 模型）
+        Returns:
+                loss: scalar Tensor (CE loss, backpropagates into the TSE model)
         """
         if audio.dim() == 1:
             audio = audio.unsqueeze(0)
         B = audio.shape[0]
 
-        # 确定每条样本的语言
+        # Language of each sample
         if languages is not None and len(languages) == B:
             per_sample_lang = languages
         elif language is not None:
             per_sample_lang = [language] * B
         else:
-            per_sample_lang = ["zh"] * B  # 兜底默认
+            per_sample_lang = ["zh"] * B  # fallback default
 
         sot_id = self.tokenizer.convert_tokens_to_ids("<|startoftranscript|>")
         eot_id = self.tokenizer.eos_token_id
@@ -670,26 +731,29 @@ class FrozenWhisperASR(nn.Module):
         for i in range(B):
             wav = audio[i]  # [T]
 
-            # ── 逐样本确定语言 token ──────────────────────────────────────
+            # ── Per-sample language token ─────────────────────────────────────────
             lang_i = per_sample_lang[i]
             lang_token = f"<|{lang_i}|>"
             forced_prefix_ids = self.tokenizer.convert_tokens_to_ids(
                 [lang_token, task_token, notimestamp]
             )
 
-            # ── 可微分 mel 计算（梯度通路）────────────────────────────────
+            # ── Differentiable mel (gradient path) ────────────────────────────────
             mel_with_grad = self._compute_mel_with_grad(wav)  # [1, N_MELS, MAX_FRAME]
 
-            # ── Encoder forward（保留梯度通路）───────────────────────────
+            # ── Encoder forward (keeps the gradient path) ─────────────────────────
             enc_out = self.hf_model.model.encoder(
                 input_features=mel_with_grad
             ).last_hidden_state  # [1, T_enc, D]
 
-            # ── Tokenize 目标文本 ─────────────────────────────────────────
-            text_ids = self.tokenizer.encode(
-                transcripts[i], add_special_tokens=False
-            )
-            # decoder 输入: [SOT, lang, task, notimestamp, text..., EOT]
+            # ── Tokenize the target text ──────────────────────────────────────────
+            text = transcripts[i]
+            # Whisper emits English text with a leading space (" Hello"), so the
+            # target must start with a space-prefixed token to be in-distribution.
+            if lang_i == "en" and not text.startswith(" "):
+                text = " " + text
+            text_ids = self.tokenizer.encode(text, add_special_tokens=False)
+            # Decoder input: [SOT, lang, task, notimestamp, text..., EOT]
             full_ids     = [sot_id] + forced_prefix_ids + text_ids + [eot_id]
             decoder_in   = torch.tensor(full_ids[:-1], dtype=torch.long,
                                         device=audio.device).unsqueeze(0)  # [1, L-1]
@@ -702,7 +766,7 @@ class FrozenWhisperASR(nn.Module):
                 encoder_hidden_states=enc_out,
             ).last_hidden_state  # [1, L-1, D]
 
-            # ── 投影到词表 ────────────────────────────────────────────────
+            # ── Project to the vocabulary ─────────────────────────────────────────
             logits = self.hf_model.proj_out(dec_out)  # [1, L-1, V]
 
             logits_flat = logits.view(-1, logits.shape[-1])  # [(L-1), V]
@@ -723,7 +787,7 @@ class FrozenWhisperASR(nn.Module):
         language: str = "zh",
     ) -> List[str]:
         """
-        推理解码（不计算梯度），用于日志记录。
+        Inference decoding (no gradients), for logging.
         """
         from transformers import WhisperProcessor
 
@@ -734,7 +798,7 @@ class FrozenWhisperASR(nn.Module):
         with torch.no_grad():
             for i in range(audio.shape[0]):
                 wav_np = audio[i].float().cpu().numpy()
-                # 使用 generate 接口（HuggingFace 标准推理）
+                # Use generate() (standard HuggingFace inference)
                 processor = WhisperProcessor.from_pretrained(
                     self.tokenizer.name_or_path
                     if hasattr(self.tokenizer, "name_or_path") else "openai/whisper-large-v3"
@@ -755,32 +819,32 @@ class FrozenWhisperASR(nn.Module):
 
 
 # ===========================================================================
-# 说话人编码器（冻结，用于相似度 Loss）
-# 使用与评估侧（wespeakerruntime）完全一致的 ResNet34 编码器：
-#   - 英文数据集（CHiME6/AMI）：voxceleb_resnet34_LM
-#   - 中文数据集（AliMeeting/AISHELL-4）：cnceleb_resnet34_LM
-# 特征提取与 wespeakerruntime/speaker.py 的 _compute_fbank 完全对齐：
+# Speaker encoders (frozen, for the similarity loss)
+# wespeaker models identical to the evaluation side (wespeakerruntime), e.g.:
+#   - English datasets (CHiME6/AMI): voxceleb_resnet34_LM
+#   - Chinese datasets (AliMeeting/AISHELL-4): cnceleb_resnet34_LM
+# Feature extraction matches wespeakerruntime/speaker.py _compute_fbank exactly:
 #   waveform * 32768 → kaldi.fbank(80mel, 25ms/10ms, hamming) → CMN(axis=0)
 # ===========================================================================
 
 class FrozenSpeakerEncoder(nn.Module):
     """
-    加载预训练 wespeaker ResNet34 说话人编码器并冻结所有参数。
-    特征提取与评估侧 wespeakerruntime 完全对齐，消除 train-eval mismatch。
+    Load a pretrained wespeaker speaker encoder and freeze all parameters.
+    Feature extraction matches the evaluation side (wespeakerruntime) to avoid a train-eval mismatch.
 
-    forward 输入: 音频波形 [B, T]，float32，16kHz
-    forward 输出: speaker embedding [B, D]
+    Forward input:  waveform [B, T], float32, 16 kHz
+    Forward output: speaker embedding [B, D]
 
-    特征提取流程（与 wespeakerruntime/speaker.py._compute_fbank 一致）：
+    Feature pipeline (same as wespeakerruntime/speaker.py._compute_fbank):
       wav * 32768 → kaldi.fbank(n_mels=80, frame_length=25ms, frame_shift=10ms,
                                 window_type='hamming', dither=0.0)
-      → CMN（按频率维度减均值，axis=0 即 dim=1）
+        → CMN (subtract the per-frequency mean over time, axis=0 i.e. dim=1)
     """
 
     def __init__(self, model_dir: str, device: str = "cuda"):
         super().__init__()
         import yaml as _yaml
-        import torchaudio.compliance.kaldi as kaldi  # noqa: F401（确认可用）
+        import torchaudio.compliance.kaldi as kaldi  # noqa: F401 (check that it is available)
 
         model_dir = Path(model_dir)
         config_path = model_dir / "config.yaml"
@@ -794,7 +858,7 @@ class FrozenSpeakerEncoder(nn.Module):
         with open(config_path, "r", encoding="utf-8") as f:
             spk_cfg = _yaml.safe_load(f)
 
-        # wespeaker ResNet34 的 config 结构：model / model_args
+        # wespeaker config layout: model / model_args
         spk_model_name   = spk_cfg.get("model", "ResNet34")
         spk_model_kwargs = spk_cfg.get("model_args", {})
 
@@ -803,7 +867,7 @@ class FrozenSpeakerEncoder(nn.Module):
         self.encoder = spk_cls(**spk_model_kwargs)
 
         ckpt = torch.load(str(model_path), map_location="cpu")
-        # 兼容多种 checkpoint 格式
+        # Support several checkpoint formats
         if isinstance(ckpt, dict) and "model" in ckpt:
             state_dict = ckpt["model"]
         elif isinstance(ckpt, dict) and "state_dict" in ckpt:
@@ -817,33 +881,42 @@ class FrozenSpeakerEncoder(nn.Module):
         if unexpected:
             logging.warning(f"[SpeakerEncoder] unexpected keys ({len(unexpected)}): {unexpected[:3]}")
 
-        # 冻结所有参数
+        # Freeze all parameters
         for p in self.encoder.parameters():
             p.requires_grad_(False)
         self.encoder.eval()
 
-        # fbank 参数（与 wespeakerruntime 一致）
-        self.sample_rate   = 16000
-        self.num_mel_bins  = spk_model_kwargs.get("feat_dim", 80)
-        self.frame_length  = 25    # ms
-        self.frame_shift   = 10    # ms
+        # fbank parameters (same as wespeakerruntime); take them from the model's own
+        # training config when present (dither is always 0 for embedding extraction)
+        fbank_args = (spk_cfg.get("dataset_args") or {}).get("fbank_args") or {}
+        self.sample_rate   = int((spk_cfg.get("dataset_args") or {}).get("resample_rate", 16000))
+        self.num_mel_bins  = int(fbank_args.get(
+            "num_mel_bins",
+            spk_model_kwargs.get("feat_dim", spk_model_kwargs.get("acoustic_dim", 80)),
+        ))
+        self.frame_length  = fbank_args.get("frame_length", 25)    # ms
+        self.frame_shift   = fbank_args.get("frame_shift", 10)     # ms
+        if self.sample_rate != 16000:
+            raise ValueError(
+                f"[SpeakerEncoder] {model_dir} expects {self.sample_rate} Hz audio; only 16 kHz is supported"
+            )
 
         logging.info(
-            f"[SpeakerEncoder] 已加载并冻结 ResNet34: {model_path}  "
+            f"[SpeakerEncoder] 已加载并冻结 {spk_model_name}: {model_path}  "
             f"fbank: n_mels={self.num_mel_bins}, frame_length={self.frame_length}ms, "
             f"frame_shift={self.frame_shift}ms"
         )
 
     def _wav_to_fbank(self, wav: torch.Tensor) -> torch.Tensor:
         """
-        将原始波形 [B, T] 转换为 fbank 特征 [B, T_frames, feat_dim]。
-        与 wespeakerruntime/speaker.py._compute_fbank 完全对齐：
-          1. wav * 32768（幅度缩放）
-          2. kaldi.fbank（hamming 窗，dither=0）
-          3. CMN：按频率维度（dim=2）减均值
+        Convert raw waveforms [B, T] to fbank features [B, T_frames, feat_dim].
+        Matches wespeakerruntime/speaker.py._compute_fbank exactly:
+            1. wav * 32768 (amplitude scaling)
+            2. kaldi.fbank (hamming window, dither=0)
+            3. CMN: subtract the per-frequency mean over time
 
-        注意：kaldi.fbank 不支持 batch，需逐样本处理后 stack。
-        该方法支持梯度传播（kaldi.fbank 内部为可微操作）。
+        Note: kaldi.fbank has no batch support, so samples are processed one by one and stacked.
+        Gradients flow through this method (kaldi.fbank is differentiable).
         """
         import torchaudio.compliance.kaldi as kaldi
 
@@ -851,7 +924,7 @@ class FrozenSpeakerEncoder(nn.Module):
         fbank_list = []
         for i in range(B):
             w = wav[i].unsqueeze(0)          # [1, T]
-            w = w * (1 << 15)                # 幅度缩放 ×32768
+            w = w * (1 << 15)                # amplitude scaling x32768
             feat = kaldi.fbank(
                 w,
                 num_mel_bins=self.num_mel_bins,
@@ -862,11 +935,11 @@ class FrozenSpeakerEncoder(nn.Module):
                 window_type="hamming",
                 use_energy=False,
             )  # [T_frames, feat_dim]
-            # CMN：按频率维度减均值（axis=0 in numpy = dim=0 in 2D tensor）
+            # CMN: subtract the per-frequency mean over time (axis=0 in numpy = dim=0 in 2D tensor)
             feat = feat - feat.mean(dim=0, keepdim=True)  # [T_frames, feat_dim]
             fbank_list.append(feat)
 
-        # pad 到相同长度后 stack
+        # Pad to the same length, then stack
         max_len = max(f.shape[0] for f in fbank_list)
         padded = []
         for f in fbank_list:
@@ -879,73 +952,67 @@ class FrozenSpeakerEncoder(nn.Module):
 
     def forward(self, wav: torch.Tensor) -> torch.Tensor:
         """
-        输入: [B, T] 或 [T]，float32，16kHz 原始波形
-        输出: [B, D] speaker embedding
+        Input:  [B, T] or [T], float32, 16 kHz raw waveform
+        Output: [B, D] speaker embedding
         """
         if wav.dim() == 1:
             wav = wav.unsqueeze(0)
         fbank = self._wav_to_fbank(wav)          # [B, T_frames, feat_dim]
         with torch.no_grad():
             emb = self.encoder(fbank)
-        # ResNet34 返回 (frame_feats, embedding) 或直接 embedding
+        # Speaker models return (frame_feats, embedding) or just the embedding
         if isinstance(emb, (tuple, list)):
             emb = emb[-1]
         return emb  # [B, D]
 
 
 # ===========================================================================
-# 说话人相似度 Ranking Loss（可选）
-# 支持双编码器：英文用 en_encoder，中文用 chs_encoder
-# 按每条样本的语言（languages 列表）选择对应编码器
+# Speaker similarity ranking loss (optional)
+# One frozen speaker encoder per language (e.g. en / zh / th); each sample uses
+# the encoder of its own language, which should match the evaluation side.
 # ===========================================================================
 
 class SpeakerSimilarityLoss(nn.Module):
     """
     Hinge ranking loss：
-      要求 TSE 输出与注册音频的余弦相似度 > mix 音频与注册音频的相似度 + margin
+        requires cos-sim(TSE output, enrollment) > cos-sim(mixture, enrollment) + margin
       loss = mean( max(0, margin - (sim(tse, enroll) - sim(mix, enroll))) )
 
-    支持双编码器（en/chs），按 languages 列表逐样本选择编码器。
-    梯度仅流经 tse_wav（enroll 和 mix 的编码在 no_grad 下计算）。
+    encoders maps a language code to its encoder; samples are routed by the
+    languages list. Gradients only flow through tse_wav.
     """
-
-    # 数据集语言映射（与评估侧 dataset_lang_overrides 保持一致）
-    DATASET_TO_LANG = {
-        "CHiME6":    "en",
-        "AMI":       "en",
-        "DipCo":     "en",
-        "AliMeeting": "zh",
-        "AISHELL-4": "zh",
-    }
 
     def __init__(
         self,
-        en_encoder:  FrozenSpeakerEncoder,
-        chs_encoder: FrozenSpeakerEncoder,
+        encoders: Dict[str, FrozenSpeakerEncoder],
         margin: float = 0.2,
     ):
         super().__init__()
-        self.en_encoder  = en_encoder
-        self.chs_encoder = chs_encoder
-        self.margin      = margin
+        if not encoders:
+            raise ValueError("[SpeakerSimilarityLoss] at least one speaker encoder is required")
+        self.encoders = nn.ModuleDict(encoders)
+        self.margin   = margin
 
     def _get_encoder(self, lang: str) -> FrozenSpeakerEncoder:
-        """根据语言返回对应编码器（zh/chs → chs_encoder，其余 → en_encoder）"""
-        if lang in ("zh", "chs", "cn"):
-            return self.chs_encoder
-        return self.en_encoder
+        key = normalize_lang(lang)
+        if key not in self.encoders:
+            # No silent fallback: a wrong-language encoder gives misleading similarities
+            raise KeyError(
+                f"no speaker encoder for language {lang!r}; configured: {sorted(self.encoders)}"
+            )
+        return self.encoders[key]
 
     def forward(
         self,
         tse_wav:    torch.Tensor,    # [B, T_tse]
         mix_wav:    torch.Tensor,    # [B, T_mix]
         enroll_wav: torch.Tensor,    # [B, T_e]
-        languages:  List[str],       # 每条样本的语言，长度 B
+        languages:  List[str],       # language of each sample, length B
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        返回: (loss, sim_tse_enroll_mean, sim_mix_enroll_mean)
-          - loss: 标量，可反向传播
-          - sim_tse_enroll_mean / sim_mix_enroll_mean: 用于日志记录的标量（detach）
+        Returns: (loss, sim_tse_enroll_mean, sim_mix_enroll_mean)
+            - loss: scalar, backpropagates
+            - sim_tse_enroll_mean / sim_mix_enroll_mean: detached scalars for logging
         """
         B = tse_wav.shape[0]
         emb_tse_list    = []
@@ -955,15 +1022,15 @@ class SpeakerSimilarityLoss(nn.Module):
         for i in range(B):
             enc = self._get_encoder(languages[i])
 
-            # enroll & mix embedding：冻结，无梯度
+            # Enrollment & mixture embeddings: frozen, no gradient
             with torch.no_grad():
                 e_enroll = enc(enroll_wav[i:i+1])   # [1, D]
                 e_mix    = enc(mix_wav[i:i+1])       # [1, D]
                 e_enroll = F.normalize(e_enroll, dim=-1)
                 e_mix    = F.normalize(e_mix,    dim=-1)
 
-            # tse embedding：需要梯度（通过 tse_wav -> fbank -> encoder 反向传播）
-            # 编码器参数冻结，但音频信号梯度可流过 _wav_to_fbank 和 encoder
+            # TSE embedding needs gradients (tse_wav -> fbank -> encoder)
+            # The encoder is frozen, but gradients w.r.t. the audio flow through _wav_to_fbank and the encoder
             fbank_tse = enc._wav_to_fbank(tse_wav[i:i+1])   # [1, T_frames, feat_dim]
             e_tse = enc.encoder(fbank_tse)
             if isinstance(e_tse, (tuple, list)):
@@ -987,24 +1054,27 @@ class SpeakerSimilarityLoss(nn.Module):
 
 
 # ===========================================================================
-# 目标说话人活动检测 Loss（Target VAD Loss）
+# Target speaker activity loss (target VAD loss)
 # ===========================================================================
 
 class TargetVADLoss(nn.Module):
     """
-    目标说话人活动检测 (Target Voice Activity Detection) 损失。
+    Target speaker voice activity loss.
 
-    思想：TSE 模型输出的音频在目标说话人不说话的帧上应当接近静音（能量很低），
-    而在目标说话人说话的帧上应当有较高能量。
+    The TSE output should be near-silent on frames where the target speaker is
+    inactive and clearly audible where the target speaker is active.
 
-    具体实现：
-      1. 将 TSE 输出音频按帧分段，计算每帧的能量（RMS 或 log power）
-      2. 根据 target_activity_segments 标签生成逐帧的 0/1 二值标签
-      3. 使用 Binary Cross-Entropy 损失对帧级能量进行监督
+    Frame levels are measured in dB relative to the loudest frame of the
+    *mixture* (not as absolute energy), so the loss does not depend on the
+    recording level and gives no incentive to simply amplify the output:
+      rel_db = 10 * log10(P_tse_frame / max(P_mix_frame))
+      logit  = (rel_db - threshold_db) / slope_db
+      loss   = BCE_with_logits(logit, frame_label)
 
-    帧移 (frame_shift) 和帧长 (frame_length) 可配置，默认 10ms shift, 25ms window @ 16kHz
+    With the defaults (threshold -40 dB, slope 5 dB): -20 dB -> p=0.98,
+    -40 dB -> p=0.5, -60 dB -> p=0.02. Levels are floored at floor_db.
 
-    梯度路径：tse_wav -> 帧能量 -> sigmoid -> BCE loss
+    Gradient path: tse_wav -> frame power -> rel_db -> BCE loss
     """
 
     def __init__(
@@ -1012,34 +1082,24 @@ class TargetVADLoss(nn.Module):
         sample_rate: int = 16000,
         frame_shift_ms: float = 10.0,
         frame_length_ms: float = 25.0,
-        energy_floor: float = 1e-8,
+        threshold_db: float = -40.0,
+        slope_db: float = 5.0,
+        floor_db: float = -80.0,
+        energy_floor: float = 1e-10,
     ):
         super().__init__()
         self.sample_rate = sample_rate
         self.frame_shift = int(sample_rate * frame_shift_ms / 1000.0)
         self.frame_length = int(sample_rate * frame_length_ms / 1000.0)
+        self.threshold_db = threshold_db
+        self.slope_db = slope_db
+        self.floor_db = floor_db
         self.energy_floor = energy_floor
 
-    def _compute_frame_energy(self, wav: torch.Tensor) -> torch.Tensor:
-        """
-        计算逐帧 log 能量（可微分）。
-
-        输入: wav [B, T]
-        输出: energy [B, N_frames]，经过 sigmoid 归一化到 [0, 1]
-        """
-        B, T = wav.shape
-        # 使用 unfold 分帧（可微分操作）
-        # wav: [B, T] -> frames: [B, N_frames, frame_length]
+    def _frame_power(self, wav: torch.Tensor) -> torch.Tensor:
+        """wav [B, T] -> mean power per frame [B, N_frames] (differentiable)"""
         frames = wav.unfold(dimension=1, size=self.frame_length, step=self.frame_shift)
-        # 计算每帧的均方根能量
-        rms = (frames ** 2).mean(dim=-1).clamp(min=self.energy_floor)  # [B, N_frames]
-        # log 能量 -> sigmoid 归一化到 (0, 1) 作为 "活动概率"
-        log_energy = torch.log(rms)
-        # 使用可学习的归一化：将 log_energy 映射到合理范围后做 sigmoid
-        # 典型范围：静音约 -18 (1e-8 的 log)，正常语音约 -2 ~ -5
-        # 线性缩放后 sigmoid：(log_energy + 10) / 5 使得 -15 -> -1 (sig=0.27), -5 -> 1 (sig=0.73)
-        activity_prob = torch.sigmoid((log_energy + 10.0) / 5.0)  # [B, N_frames]
-        return activity_prob
+        return (frames ** 2).mean(dim=-1)
 
     def _segments_to_frame_labels(
         self,
@@ -1048,10 +1108,10 @@ class TargetVADLoss(nn.Module):
         device: torch.device,
     ) -> torch.Tensor:
         """
-        将时间段标签 [[start1, end1], [start2, end2], ...] 转换为逐帧 0/1 标签。
+        Convert time segments [[start1, end1], [start2, end2], ...] into per-frame 0/1 labels.
 
-        segments 中的时间单位为秒（相对于 mixture 起始的偏移）。
-        输出: [num_frames] float Tensor, 1.0=说话, 0.0=静音
+        Segment times are in seconds, relative to the mixture start.
+        Output: [num_frames] float Tensor, 1.0 = speaking, 0.0 = silent
         """
         labels = torch.zeros(num_frames, device=device)
         for seg in segments:
@@ -1067,26 +1127,29 @@ class TargetVADLoss(nn.Module):
     def forward(
         self,
         tse_wav: torch.Tensor,                        # [B, T]
-        vad_segments: List[Optional[List[List[float]]]],  # batch 中每条样本的 VAD segments
-        mix_lens: torch.Tensor,                       # [B] 实际长度
+        vad_segments: List[Optional[List[List[float]]]],  # VAD segments of each sample in the batch
+        mix_lens: torch.Tensor,                       # [B] real lengths
+        mix_wav: torch.Tensor,                        # [B, T] mixture (level reference)
     ) -> torch.Tensor:
         """
-        计算目标说话人活动检测 BCE 损失。
+        Target speaker activity BCE loss.
 
-        参数:
-            tse_wav:      TSE 输出音频 [B, T]
-            vad_segments: 每条样本的 VAD 时间段列表（None 表示该样本无标签，跳过）
-            mix_lens:     每条样本的实际音频长度（采样点数）
+        Args:
+                tse_wav:      TSE output audio [B, T]
+                vad_segments: per-sample VAD segments (None = no label, sample skipped)
+                mix_lens:     per-sample real audio length (samples)
+            mix_wav:      mixture [B, T]; its loudest frame is the 0 dB reference
 
-        返回:
-            loss: 标量 Tensor（可反向传播）
+        Returns:
+                loss: scalar Tensor (backpropagates)
         """
         B = tse_wav.shape[0]
         device = tse_wav.device
 
-        # 计算帧级活动概率
-        activity_prob = self._compute_frame_energy(tse_wav)  # [B, N_frames]
-        N_frames = activity_prob.shape[1]
+        tse_power = self._frame_power(tse_wav.float())            # [B, N_frames]
+        with torch.no_grad():
+            mix_power = self._frame_power(mix_wav.float())        # [B, N_frames]
+        N_frames = min(tse_power.shape[1], mix_power.shape[1])
 
         total_loss = torch.tensor(0.0, device=device, requires_grad=True)
         valid_count = 0
@@ -1095,25 +1158,25 @@ class TargetVADLoss(nn.Module):
             if vad_segments[i] is None:
                 continue
 
-            # 该样本实际帧数
-            actual_len = mix_lens[i].item()
+            # Frames that lie fully inside the real (unpadded) audio
+            actual_len = int(mix_lens[i].item())
             actual_frames = min(
-                int(actual_len / self.frame_shift),
+                (actual_len - self.frame_length) // self.frame_shift + 1,
                 N_frames,
             )
             if actual_frames <= 0:
                 continue
 
-            # 生成帧级标签
             labels = self._segments_to_frame_labels(
                 vad_segments[i], actual_frames, device
             )  # [actual_frames]
 
-            # 截取对应帧的预测
-            pred = activity_prob[i, :actual_frames]  # [actual_frames]
+            ref = mix_power[i, :actual_frames].max().clamp(min=self.energy_floor)
+            rel = (tse_power[i, :actual_frames] / ref).clamp(min=10 ** (self.floor_db / 10))
+            rel_db = 10.0 * torch.log10(rel)
+            logits = (rel_db - self.threshold_db) / self.slope_db
 
-            # BCE loss
-            loss_i = F.binary_cross_entropy(pred, labels, reduction="mean")
+            loss_i = F.binary_cross_entropy_with_logits(logits, labels, reduction="mean")
             total_loss = total_loss + loss_i
             valid_count += 1
 
@@ -1124,15 +1187,15 @@ class TargetVADLoss(nn.Module):
 
 
 # ===========================================================================
-# 学习率调度器
+# Learning-rate scheduler
 # ===========================================================================
 
 class ExponentialDecayScheduler:
     """
-    指数衰减学习率调度器（与 wesep 中保持一致）。
+    Exponential-decay LR scheduler (same as wesep).
 
-    warm_up_epoch 轮内从 initial_lr 线性预热（或从 0 开始），
-    之后按指数从 initial_lr 衰减到 final_lr。
+    Linear warm-up to initial_lr over warm_up_epoch epochs (from initial_lr, or from 0),
+    then exponential decay from initial_lr to final_lr.
     """
 
     def __init__(
@@ -1168,13 +1231,13 @@ class ExponentialDecayScheduler:
             frac  = self._step / self.warm_steps
             return start + frac * (self.initial_lr - start)
 
-        # 指数衰减阶段
+        # Exponential decay phase
         decay_steps = self.total_steps - self.warm_steps
         step_in_decay = self._step - self.warm_steps
         if decay_steps <= 0:
             return self.final_lr
         frac = step_in_decay / decay_steps
-        # log-linear 插值
+        # Log-linear interpolation
         lr = self.initial_lr * (self.final_lr / self.initial_lr) ** frac
         return float(np.clip(lr, self.final_lr, self.initial_lr))
 
@@ -1189,7 +1252,7 @@ class ExponentialDecayScheduler:
 
 
 # ===========================================================================
-# Checkpoint 工具
+# Checkpoint utilities
 # ===========================================================================
 
 def save_checkpoint(
@@ -1200,11 +1263,13 @@ def save_checkpoint(
     optimizer: torch.optim.Optimizer,
     scheduler: ExponentialDecayScheduler,
     best_loss: float,
+    epoch_finished: bool = False,
 ):
     torch.save(
         {
             "step":      step,
             "epoch":     epoch,
+            "epoch_finished": epoch_finished,  # True: epoch completed, resume from epoch + 1
             "model":     tse_model.state_dict(),
             "optimizer": optimizer.state_dict(),
             "scheduler": scheduler.state_dict(),
@@ -1219,9 +1284,9 @@ def load_checkpoint(
     tse_model: nn.Module,
     optimizer: Optional[torch.optim.Optimizer] = None,
     scheduler: Optional[ExponentialDecayScheduler] = None,
-) -> Tuple[int, int, float]:
+) -> Tuple[int, int, float, bool]:
     """
-    返回 (step, epoch, best_loss)
+    Returns (step, epoch, best_loss, epoch_finished)
     """
     logging.info(f"[Ckpt] 从 {path} 恢复训练")
     ckpt = torch.load(path, map_location="cpu")
@@ -1230,11 +1295,21 @@ def load_checkpoint(
         optimizer.load_state_dict(ckpt["optimizer"])
     if scheduler is not None and "scheduler" in ckpt:
         scheduler.load_state_dict(ckpt["scheduler"])
-    return ckpt.get("step", 0), ckpt.get("epoch", 0), ckpt.get("best_loss", float("inf"))
+    epoch_finished = ckpt.get("epoch_finished")
+    if epoch_finished is None:
+        # Older checkpoints lack this field: infer from the file name (epoch-end / best = finished)
+        name = Path(path).resolve().name
+        epoch_finished = name.startswith(("checkpoint_epoch", "best_checkpoint"))
+    return (
+        ckpt.get("step", 0),
+        ckpt.get("epoch", 0),
+        ckpt.get("best_loss", float("inf")),
+        bool(epoch_finished),
+    )
 
 
 def rotate_checkpoints(ckpt_dir: str, max_keep: int):
-    """保留最新 max_keep 个 checkpoint_step*.pt，删除旧的"""
+    """Keep the newest max_keep checkpoint_step*.pt files and delete older ones"""
     ckpts = sorted(Path(ckpt_dir).glob("checkpoint_step*.pt"))
     if len(ckpts) > max_keep:
         for old in ckpts[: len(ckpts) - max_keep]:
@@ -1243,7 +1318,7 @@ def rotate_checkpoints(ckpt_dir: str, max_keep: int):
 
 
 # ===========================================================================
-# 训练主循环
+# Training loop
 # ===========================================================================
 
 def run_tse_forward(
@@ -1252,20 +1327,20 @@ def run_tse_forward(
     enroll: torch.Tensor,      # [B, T_e]
 ) -> torch.Tensor:
     """
-    调用 TSE 模型提取目标说话人音频。
-    兼容 wesep BSRNN（旧版）和 TSE_BSRNN_SPK（新版）两种接口。
+    Run the TSE model to extract the target speaker audio.
+    Supports both the legacy wesep BSRNN and the newer TSE_BSRNN_SPK interfaces.
 
-    返回: tse_out [B, T]（与 mixture 长度相同）
+    Returns: tse_out [B, T] (same length as the mixture)
     """
     out = tse_model(mixture, enroll)
 
-    # 处理不同返回格式
+    # Handle different return formats
     if isinstance(out, (tuple, list)):
-        tse_out = out[0]  # 第一个输出为分离音频
+        tse_out = out[0]  # the first output is the separated audio
     else:
         tse_out = out
 
-    # 确保 shape 为 [B, T]
+    # Make sure the shape is [B, T]
     if tse_out.dim() == 3:
         tse_out = tse_out.squeeze(1)   # [B, 1, T] -> [B, T]
 
@@ -1291,9 +1366,9 @@ def train_one_epoch(
     world_size:   int = 1,
 ) -> Tuple[float, int]:
     """
-    单 epoch 训练。返回 (epoch_loss, global_step)
-    多卡：每张卡独立跑 dataloader 的一个分片，loss 通过 all-reduce 同步后 rank0 写日志。
-    Checkpoint 仅 rank0（is_main=True）写入。
+    Train one epoch. Returns (epoch_loss, global_step).
+    Multi-GPU: each GPU runs its own dataloader shard; losses are all-reduced and rank 0 logs them.
+    Only rank 0 (is_main=True) writes checkpoints.
     """
     tse_model.train()
 
@@ -1302,7 +1377,7 @@ def train_one_epoch(
     lambda_sim     = cfg.get("lambda_sim",     0.5)
     lambda_vad     = cfg.get("lambda_vad",     0.5)
     lambda_dnsmos  = cfg.get("lambda_dnsmos",  0.0)
-    # 兼容旧版 lambda_spk
+    # Backward compatibility with the old lambda_spk
     if cfg.get("lambda_spk", 0.0) > 0 and loss_mode == "ce":
         loss_mode  = "combined"
         lambda_sim = cfg["lambda_spk"]
@@ -1315,7 +1390,7 @@ def train_one_epoch(
     model_dir      = Path(exp_dir) / "models"
     asr_language   = cfg.get("asr_language", "zh")
 
-    # 三种 loss 模式校验
+    # Validate the loss mode
     valid_modes = ("ce", "similarity", "combined")
     if loss_mode not in valid_modes:
         raise ValueError(f"[Train] 无效 loss_mode={loss_mode!r}，合法值: {valid_modes}")
@@ -1330,12 +1405,13 @@ def train_one_epoch(
             "请在 config 中配置 whisper_model_path"
         )
 
-    enable_amp    = cfg.get("enable_amp", False)
-    amp_dtype_str = cfg.get("amp_dtype", "float32")
-    amp_dtype     = torch.bfloat16 if amp_dtype_str == "bfloat16" else torch.float16
-    scaler        = torch.cuda.amp.GradScaler(enabled=enable_amp and amp_dtype != torch.bfloat16)
+    amp_dtype     = parse_amp_dtype(cfg.get("amp_dtype", "float32"))
+    # AMP is on only when enabled AND a half-precision dtype is chosen
+    enable_amp    = bool(cfg.get("enable_amp", False)) and amp_dtype is not None
+    # Loss scaling is only needed for float16; bfloat16 has the float32 range
+    scaler        = torch.cuda.amp.GradScaler(enabled=enable_amp and amp_dtype == torch.float16)
 
-    # 取 raw module（用于 checkpoint 保存和获取 spk_encoder）
+    # Unwrapped module (for checkpoint saving and the speaker encoder)
     raw_model = tse_model.module if hasattr(tse_model, "module") else tse_model
 
     running_loss   = 0.0
@@ -1344,27 +1420,31 @@ def train_one_epoch(
     running_vad    = 0.0
     running_dnsmos = 0.0
     n_batches      = 0
+    # Whole-epoch totals (running_* are reset every log_every steps)
+    epoch_loss_sum = 0.0
+    epoch_batches  = 0
     best_loss    = cfg.get("_best_loss", float("inf"))
 
-    # 仅 rank0 显示进度条
+    # Progress bar on rank 0 only
     pbar = tqdm(dataloader, desc=f"Epoch {epoch}", dynamic_ncols=True, leave=False,
                 disable=not is_main)
 
     for batch in pbar:
-        if batch is None:
+        # If any rank gets an empty batch, all ranks skip together; otherwise DDP collectives hang
+        if not all_ranks_ok(batch is not None, device):
             continue
 
         mixture      = batch["mixture"].to(device)       # [B, T]
         enroll       = batch["enroll"].to(device)        # [B, T_e]
         mix_lens     = batch["mix_lens"].to(device)      # [B]
         transcripts  = batch["transcripts"]              # List[str]
-        languages    = batch.get("languages", None)      # List[str] 或 None
+        languages    = batch.get("languages", None)      # List[str] or None
         vad_segments = batch.get("vad_segments", None)   # List[Optional[List]]
 
         optimizer.zero_grad()
 
-        # ── 1. TSE 前向 ─────────────────────────────────────────────────
-        with torch.cuda.amp.autocast(enabled=enable_amp, dtype=amp_dtype):
+        # ── 1. TSE forward ─────────────────────────────────────────────────
+        with torch.cuda.amp.autocast(enabled=enable_amp, dtype=amp_dtype or torch.float16):
             tse_out = run_tse_forward(tse_model, mixture, enroll)  # [B, T]
 
         # ── 2. ASR CE Loss ──────────────────────────────────────────────
@@ -1376,17 +1456,17 @@ def train_one_epoch(
         sim_mix_enroll_mean = torch.tensor(0.0, device=device)
 
         if loss_mode in ("ce", "combined"):
-            # 使用 batch 中每条样本的实际语言（修复中英混合 batch 的语言偏置问题）
+            # Use each sample's own language (fixes language bias in mixed zh/en batches)
             ce_loss = asr_model(
                 tse_out,
                 transcripts,
-                language=asr_language,   # 兜底语言（当 languages 为 None 时使用）
-                languages=languages,     # 优先使用逐样本语言
+                language=asr_language,   # fallback language (used when languages is None)
+                languages=languages,     # per-sample languages take precedence
             )
 
-        # ── 3. 说话人相似度 Ranking Loss ────────────────────────────────
-        # 目标：sim(tse_out, enroll) > sim(mix, enroll) + margin
-        # 按每条样本的语言选择对应编码器（en/chs）
+        # ── 3. Speaker similarity ranking loss ─────────────────────────────
+        # Goal: sim(tse_out, enroll) > sim(mix, enroll) + margin
+        # Each sample uses the encoder of its language (spk_encoders)
         if loss_mode in ("similarity", "combined") and spk_loss_fn is not None:
             try:
                 sim_loss, sim_tse_enroll_mean, sim_mix_enroll_mean = spk_loss_fn(
@@ -1397,16 +1477,16 @@ def train_one_epoch(
                 logger.warning(f"[Train] spk sim loss 计算失败: {e}")
                 sim_loss = torch.tensor(0.0, device=device)
 
-        # ── 3.5. 目标说话人活动检测 Loss ─────────────────────────────────
+        # ── 3.5. Target speaker activity (VAD) loss ────────────────────────
         if loss_mode == "combined" and vad_loss_fn is not None and vad_segments is not None:
             try:
-                vad_loss = vad_loss_fn(tse_out, vad_segments, mix_lens)
+                vad_loss = vad_loss_fn(tse_out, vad_segments, mix_lens, mixture)
             except Exception as e:
                 logger.warning(f"[Train] VAD loss 计算失败: {e}")
                 vad_loss = torch.tensor(0.0, device=device)
 
-        # ── 3.6. 可微分 DNSMOS Loss ─────────────────────────────────────
-        # 不需要参考音：DNSMOSLoss.forward 中 ref 仅接口对齐，不参与 DNSMOS 计算
+        # ── 3.6. Differentiable DNSMOS loss ────────────────────────────────
+        # No reference needed: ref in DNSMOSLoss.forward is interface-only and unused
         if loss_mode == "combined" and dnsmos_loss_fn is not None and lambda_dnsmos > 0:
             try:
                 dnsmos_loss = dnsmos_loss_fn(inf=tse_out).mean()
@@ -1414,7 +1494,7 @@ def train_one_epoch(
                 logger.warning(f"[Train] DNSMOS loss 计算失败: {e}")
                 dnsmos_loss = torch.tensor(0.0, device=device)
 
-        # ── 4. 合并 Loss ────────────────────────────────────────────────
+        # ── 4. Combine losses ──────────────────────────────────────────────
         if loss_mode == "ce":
             loss = lambda_ce * ce_loss
         elif loss_mode == "similarity":
@@ -1425,7 +1505,8 @@ def train_one_epoch(
                   + lambda_vad   * vad_loss
                   + lambda_dnsmos * dnsmos_loss)
 
-        if not torch.isfinite(loss):
+        # Same for non-finite losses: if any rank has one, all ranks skip backward
+        if not all_ranks_ok(bool(torch.isfinite(loss)), device):
             if is_main:
                 logger.warning(f"[Train] step={global_step} loss 非有限值，跳过")
             optimizer.zero_grad()
@@ -1433,8 +1514,8 @@ def train_one_epoch(
             scheduler.step()
             continue
 
-        # ── 5. 反向传播 ─────────────────────────────────────────────────
-        if enable_amp and amp_dtype != torch.bfloat16:
+        # ── 5. Backward ────────────────────────────────────────────────────
+        if scaler.is_enabled():
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
             nn.utils.clip_grad_norm_(tse_model.parameters(), clip_grad)
@@ -1448,7 +1529,7 @@ def train_one_epoch(
         scheduler.step()
         global_step += 1
 
-        # ── 6. 跨卡 loss 同步（用于日志，不影响梯度）────────────────────
+        # ── 6. Cross-GPU loss sync (logging only, gradients unaffected) ─────
         loss_t    = reduce_mean(loss.detach())
         ce_t      = reduce_mean(ce_loss.detach() if torch.is_tensor(ce_loss) else
                                 torch.tensor(ce_loss, device=device))
@@ -1478,6 +1559,8 @@ def train_one_epoch(
         running_vad    += vad_val
         running_dnsmos += dnsmos_val
         n_batches      += 1
+        epoch_loss_sum += loss_val
+        epoch_batches  += 1
 
         current_lr = scheduler.get_last_lr()
         if is_main:
@@ -1489,7 +1572,7 @@ def train_one_epoch(
             if loss_mode == "combined" and vad_loss_fn is not None:
                 postfix["vad"] = f"{vad_val:.4f}"
             if loss_mode == "combined" and dnsmos_loss_fn is not None and lambda_dnsmos > 0:
-                postfix["dnsmos_loss"] = f"{dnsmos_val:.4f}"  # 负值，越接近 0 越好
+                postfix["dnsmos_loss"] = f"{dnsmos_val:.4f}"  # negative; closer to 0 is better
             pbar.set_postfix(postfix)
 
         if global_step % log_every == 0 and is_main:
@@ -1527,14 +1610,14 @@ def train_one_epoch(
             running_loss = running_ce = running_sim = running_vad = running_dnsmos = 0.0
             n_batches = 0
 
-        # ── 7. 定期保存 checkpoint（仅 rank0）─────────────────────────
+        # ── 7. Periodic checkpoint (rank 0 only) ───────────────────────────
         if global_step % save_step_int == 0 and is_main:
             ckpt_path = model_dir / f"checkpoint_step{global_step:07d}.pt"
             save_checkpoint(
                 str(ckpt_path),
                 step=global_step,
                 epoch=epoch,
-                tse_model=raw_model,      # 保存 raw module，不含 DDP 包装
+                tse_model=raw_model,      # save the raw module, without the DDP wrapper
                 optimizer=optimizer,
                 scheduler=scheduler,
                 best_loss=best_loss,
@@ -1546,12 +1629,13 @@ def train_one_epoch(
             rotate_checkpoints(str(model_dir), max_keep_ckpts)
             logger.info(f"[Ckpt] 保存 step={global_step}: {ckpt_path.name}")
 
-    epoch_loss = running_loss / max(n_batches, 1)
+    # No valid batches -> inf, so the epoch is never picked as best
+    epoch_loss = epoch_loss_sum / epoch_batches if epoch_batches > 0 else float("inf")
     return epoch_loss, global_step
 
 
 # ===========================================================================
-# 配置加载
+# Config loading
 # ===========================================================================
 
 def load_config(config_path: str, overrides: Optional[Dict] = None) -> Dict:
@@ -1563,11 +1647,28 @@ def load_config(config_path: str, overrides: Optional[Dict] = None) -> Dict:
 
 
 def resolve_path(path: str, base: Path) -> str:
-    """将相对于脚本目录的路径解析为绝对路径"""
+    """Resolve a path relative to the script directory to an absolute path"""
     p = Path(path)
     if not p.is_absolute():
         p = (base / p).resolve()
     return str(p)
+
+
+_AMP_DTYPES: Dict[str, Optional[torch.dtype]] = {
+    "bfloat16": torch.bfloat16, "bf16": torch.bfloat16,
+    "float16": torch.float16, "fp16": torch.float16, "half": torch.float16,
+    "float32": None, "fp32": None, "float": None,
+}
+
+
+def parse_amp_dtype(name) -> Optional[torch.dtype]:
+    """amp_dtype config value -> autocast dtype (None = full float32, AMP off)."""
+    key = str(name).strip().lower()
+    if key not in _AMP_DTYPES:
+        raise ValueError(
+            f"invalid amp_dtype={name!r}; use one of: bfloat16/bf16, float16/fp16, float32/fp32"
+        )
+    return _AMP_DTYPES[key]
 
 
 def setup_logging(exp_dir: str) -> logging.Logger:
@@ -1588,7 +1689,7 @@ def setup_logging(exp_dir: str) -> logging.Logger:
 
 
 # ===========================================================================
-# Epoch 后台评估
+# Background evaluation after each epoch
 # ===========================================================================
 
 def launch_async_epoch_eval(
@@ -1599,13 +1700,13 @@ def launch_async_epoch_eval(
     cfg: Optional[Dict] = None,
 ) -> Dict:
     """
-    在每个 epoch 结束后后台启动一次 REAL-T 全量评估。
+    Launch a full REAL-T evaluation in the background after each epoch.
 
-    特性：
-      - 仅建议在 rank0 调用
-      - 默认若上一轮评估仍在运行，则跳过本轮，避免评估堆积
-      - 评估完成后，将 output 目录下生成的 *_summary.txt 复制到
-        <exp_dir>/eval_summaries/ 中，按 epoch 归档，避免后续覆盖
+    Behaviour:
+        - intended to be called on rank 0 only
+        - by default, skips this epoch if the previous evaluation is still running
+        - after evaluation, copies the *_summary.txt from the output directory to
+            <exp_dir>/eval_summaries/, archived per epoch so later runs don't overwrite it
     """
     state = dict(state or {})
     cfg = cfg or {}
@@ -1684,7 +1785,7 @@ fi
 
 
 # ===========================================================================
-# DDP 工具
+# DDP utilities
 # ===========================================================================
 
 def is_dist_avail_and_initialized() -> bool:
@@ -1709,11 +1810,11 @@ def is_main_process() -> bool:
 
 def setup_ddp():
     """
-    初始化 DDP。torchrun 会自动设置 RANK / LOCAL_RANK / WORLD_SIZE 环境变量。
-    单卡时不做任何事。
+    Initialize DDP. torchrun sets the RANK / LOCAL_RANK / WORLD_SIZE environment variables.
+    Does nothing on a single GPU.
     """
     if "LOCAL_RANK" not in os.environ:
-        return  # 单卡模式，不初始化
+        return  # single-GPU mode, nothing to initialize
 
     local_rank = int(os.environ["LOCAL_RANK"])
     torch.cuda.set_device(local_rank)
@@ -1726,7 +1827,7 @@ def cleanup_ddp():
 
 
 def reduce_mean(tensor: torch.Tensor) -> torch.Tensor:
-    """跨卡 all-reduce 取均值（仅多卡时有效）"""
+    """All-reduce mean across GPUs (no-op on a single GPU)"""
     if not is_dist_avail_and_initialized():
         return tensor
     t = tensor.clone()
@@ -1735,9 +1836,42 @@ def reduce_mean(tensor: torch.Tensor) -> torch.Tensor:
     return t
 
 
+def all_ranks_ok(ok: bool, device: torch.device) -> bool:
+    """True only if ok is True on every rank (keeps DDP ranks skipping in lockstep)"""
+    if not is_dist_avail_and_initialized():
+        return ok
+    t = torch.tensor(0 if ok else 1, dtype=torch.int32, device=device)
+    dist.all_reduce(t, op=dist.ReduceOp.MAX)
+    return t.item() == 0
+
+
 # ===========================================================================
-# 主入口
+# Entry point
 # ===========================================================================
+
+def resolve_spk_encoder_paths(cfg: Dict) -> Dict[str, str]:
+    """
+    Language -> speaker encoder directory.
+    New style:    spk_encoders: {en: ..., zh: ..., th: ...}
+    Legacy keys:  spk_encoder_en_path / spk_encoder_chs_path (still honored;
+                  spk_encoders entries take precedence).
+    """
+    paths: Dict[str, str] = {}
+    if cfg.get("spk_encoder_en_path"):
+        paths["en"] = cfg["spk_encoder_en_path"]
+    if cfg.get("spk_encoder_chs_path"):
+        paths["zh"] = cfg["spk_encoder_chs_path"]
+    for lang, path in (cfg.get("spk_encoders") or {}).items():
+        if path:
+            paths[normalize_lang(lang)] = path
+    if not paths:
+        # Original author's defaults
+        paths = {
+            "en": "/home/yuque3/nwy/real-t/spk_emb_models/voxceleb_resnet34_LM",
+            "zh": "/home/yuque3/nwy/real-t/spk_emb_models/cnceleb_resnet34_LM",
+        }
+    return {lang: resolve_path(p, _SCRIPT_DIR) for lang, p in paths.items()}
+
 
 def main():
     parser = argparse.ArgumentParser(description="TSE-ASR 端到端训练（支持单卡/多卡 DDP）")
@@ -1757,31 +1891,37 @@ def main():
         help="实验目录（覆盖 config 中的 exp_dir）",
     )
     parser.add_argument(
+        "--pretrained_tse",
+        type=str, default=None,
+        help="Initialize model weights only from this checkpoint (overrides pretrained_tse in config; optimizer/step/epoch are not restored)",
+    )
+    parser.add_argument(
         "--max_samples",
         type=int, default=None,
         help="最大训练样本数（覆盖 config）",
     )
     args = parser.parse_args()
 
-    # ── DDP 初始化 ────────────────────────────────────────────────────────
+    # ── DDP init ──────────────────────────────────────────────────────────
     setup_ddp()
     rank       = get_rank()
     world_size = get_world_size()
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     is_main    = is_main_process()
 
-    # ── 加载配置 ─────────────────────────────────────────────────────────
+    # ── Load config ───────────────────────────────────────────────────────
     cfg = load_config(args.config)
 
-    # 命令行覆盖
+    # Command-line overrides
     if args.resume      is not None: cfg["resume"]               = args.resume
     if args.exp_dir     is not None: cfg["exp_dir"]              = args.exp_dir
+    if args.pretrained_tse is not None: cfg["pretrained_tse"]    = args.pretrained_tse
     if args.max_samples is not None: cfg["data"]["max_samples"]  = args.max_samples
 
-    # 生成带时间戳的实验目录（rank0 生成时间戳，广播给所有 rank 保持一致）
+    # Timestamped experiment dir (rank 0 creates the timestamp and broadcasts it to all ranks)
     exp_dir_raw = cfg.get("exp_dir", "exp/tse_asr")
     exp_dir_abs = resolve_path(exp_dir_raw, _SCRIPT_DIR)
-    # 检查目录名是否已有时间戳前缀（格式：YYYYMMDD_HHMMSS_...）
+    # Check whether the dir name already has a timestamp prefix (YYYYMMDD_HHMMSS_...)
     _name = Path(exp_dir_abs).name
     _parts = _name.split("_")
     _already_timestamped = (
@@ -1792,17 +1932,17 @@ def main():
     if not _already_timestamped:
         if is_main:
             ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-            # 使用 config 中 exp_dir 的目录名作为模型标签（如 bsrnn_ecapa_vox1）
+            # Use the config's exp_dir name as the model tag (e.g. bsrnn_ecapa_vox1)
             model_tag = Path(exp_dir_raw).name
             exp_dir_abs = str(Path(exp_dir_abs).parent / f"{ts}_{model_tag}")
-        # 多卡时广播 exp_dir 字符串给所有 rank
+        # Broadcast the exp_dir string to all ranks
         if world_size > 1:
             buf = [exp_dir_abs]
             dist.broadcast_object_list(buf, src=0)
             exp_dir_abs = buf[0]
     cfg["exp_dir"] = exp_dir_abs
 
-    # 仅 rank0 创建目录
+    # Only rank 0 creates directories
     model_dir = Path(exp_dir_abs) / "models"
     tb_dir    = Path(exp_dir_abs) / "tensorboard"
     if is_main:
@@ -1811,16 +1951,23 @@ def main():
     if world_size > 1:
         dist.barrier()
 
-    # ── 日志（仅 rank0 写文件，其余 rank 只写 stdout）───────────────────
+    # ── Logging (rank 0 writes the log file; other ranks log to stdout) ──
     logger = setup_logging(exp_dir_abs) if is_main else logging.getLogger("tse_asr_train")
     if not is_main:
         logging.basicConfig(level=logging.WARNING)
 
-    # TensorBoard 仅 rank0
+    # TensorBoard on rank 0 only
     writer = SummaryWriter(log_dir=str(tb_dir)) if is_main else None
 
+    amp_dtype = parse_amp_dtype(cfg.get("amp_dtype", "float32"))   # fail fast on typos
     if is_main:
         logger.info(f"实验目录: {exp_dir_abs}")
+        if cfg.get("enable_amp", False) and amp_dtype is None:
+            logger.warning("enable_amp is true but amp_dtype is float32; training in full float32")
+        logger.info(
+            f"Precision: "
+            f"{amp_dtype if cfg.get('enable_amp', False) and amp_dtype is not None else 'float32 (AMP off)'}"
+        )
         logger.info(f"配置文件: {args.config}")
         logger.info(f"多卡训练: world_size={world_size}")
 
@@ -1828,14 +1975,14 @@ def main():
         if not config_save_path.exists():
             shutil.copy(args.config, str(config_save_path))
 
-    # ── 随机种子（各 rank 加 rank 偏移）──────────────────────────────────
+    # ── Random seed (offset by rank) ──────────────────────────────────────
     seed = cfg.get("seed", 42) + rank
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
-    # ── 设备 ──────────────────────────────────────────────────────────────
+    # ── Device ────────────────────────────────────────────────────────────
     if torch.cuda.is_available():
         device = torch.device(f"cuda:{local_rank}")
     else:
@@ -1843,16 +1990,16 @@ def main():
     if is_main:
         logger.info(f"rank={rank} 使用设备: {device}，world_size={world_size}")
 
-    # ── 数据集 ────────────────────────────────────────────────────────────
+    # ── Dataset ───────────────────────────────────────────────────────────
     data_cfg = cfg["data"]
 
-    # 解析训练数据根目录列表，支持三种写法：
-    #   train_roots: [path1, path2, ...]   → 多根目录（新写法）
-    #   train_root: path                   → 单根目录（旧写法，向后兼容）
-    #   两者同时存在时 train_roots 优先
+    # Training data roots; accepted forms:
+    #   train_roots: [path1, path2, ...]   → multiple roots (new style)
+    #   train_root: path                   → single root (old style, still supported)
+    #   if both are set, train_roots wins
     _roots_raw = data_cfg.get("train_roots", None)
     if _roots_raw is None:
-        # 兼容旧字段 train_root（单字符串）
+        # Backward compatibility with the old train_root (single string)
         _root_single = data_cfg.get("train_root", None)
         if _root_single is None:
             raise ValueError("[Data] 配置中必须指定 train_roots 或 train_root")
@@ -1873,9 +2020,10 @@ def main():
         max_enroll_len     = data_cfg.get("max_enroll_len", 160000),
         min_transcript_len = data_cfg.get("min_transcript_len", 2),
         max_samples        = data_cfg.get("max_samples", 0),
+        peak_normalize     = data_cfg.get("peak_normalize", True),
     )
 
-    # DDP: 用 DistributedSampler 替代 shuffle=True
+    # DDP: DistributedSampler replaces shuffle=True
     sampler = (
         DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True)
         if world_size > 1
@@ -1884,7 +2032,7 @@ def main():
     dataloader = DataLoader(
         train_dataset,
         batch_size  = cfg.get("batch_size", 1),
-        shuffle     = (sampler is None),   # 单卡 shuffle，多卡由 sampler 负责
+        shuffle     = (sampler is None),   # shuffle on a single GPU; the sampler handles it on multiple GPUs
         sampler     = sampler,
         num_workers = cfg.get("num_workers", 4),
         collate_fn  = tse_asr_collate_fn,
@@ -1894,7 +2042,7 @@ def main():
     if is_main:
         logger.info(f"DataLoader: {len(train_dataset)} 条样本，{len(dataloader)} 个 batch/epoch/rank")
 
-    # ── TSE 模型 ──────────────────────────────────────────────────────────
+    # ── TSE model ─────────────────────────────────────────────────────────
     _DEFAULT_TSE = "/home/yuque3/nwy/real-t/REAL-TSE-Challenge/pretrained/bsrnn_ecapa_vox1/avg_model.pt"
     pretrained_tse = cfg.get("pretrained_tse", _DEFAULT_TSE) or _DEFAULT_TSE
     if pretrained_tse and not os.path.isabs(pretrained_tse):
@@ -1903,7 +2051,7 @@ def main():
     tse_model = build_tse_model(cfg, pretrained_path=pretrained_tse)
     tse_model = tse_model.to(device)
 
-    # 多卡：封装 DDP
+    # Multi-GPU: wrap in DDP
     if world_size > 1:
         tse_model = torch.nn.parallel.DistributedDataParallel(
             tse_model,
@@ -1918,9 +2066,9 @@ def main():
         n_train  = sum(p.numel() for p in _m.parameters() if p.requires_grad)
         logger.info(f"TSE 模型参数: 总量={n_params/1e6:.2f}M，可训练={n_train/1e6:.2f}M")
 
-    # ── 解析 loss_mode（main 内统一确定）─────────────────────────────────
+    # ── Resolve loss_mode (decided once, here in main) ────────────────────
     loss_mode = cfg.get("loss_mode", "combined")
-    # 兼容旧版 lambda_spk
+    # Backward compatibility with the old lambda_spk
     if cfg.get("lambda_spk", 0.0) > 0 and loss_mode == "ce":
         loss_mode = "combined"
     valid_modes = ("ce", "similarity", "combined")
@@ -1929,7 +2077,7 @@ def main():
     if is_main:
         logger.info(f"[Loss] loss_mode={loss_mode}")
 
-    # ── ASR 模型（冻结 Whisper，仅 ce / combined 模式加载）──────────────
+    # ── ASR model (frozen Whisper; loaded only for ce / combined) ─────────
     asr_model = None
     if loss_mode in ("ce", "combined"):
         _DEFAULT_WHISPER = "/home/yuque3/nwy/models/whisper-large-v3"
@@ -1938,37 +2086,39 @@ def main():
             whisper_path = resolve_path(whisper_path, _SCRIPT_DIR)
         asr_model = FrozenWhisperASR(whisper_path, device=str(device))
         asr_model = asr_model.to(device)
+        asr_model.check_languages(train_dataset.languages())
         if is_main:
             logger.info(f"[ASR] Whisper 已加载: {whisper_path}")
     else:
         if is_main:
             logger.info("[ASR] loss_mode=similarity，跳过 Whisper 加载")
 
-    # ── 说话人相似度 Loss（仅 similarity / combined 模式加载）────────────
-    # 使用与评估侧完全一致的双 ResNet34 编码器（en/chs）
+    # ── Speaker similarity loss (loaded only for similarity / combined) ──
+    # One encoder per language, matching the evaluation side
     spk_loss_fn = None
     if loss_mode in ("similarity", "combined"):
-        _DEFAULT_EN_SPK_DIR  = "/home/yuque3/nwy/real-t/spk_emb_models/voxceleb_resnet34_LM"
-        _DEFAULT_CHS_SPK_DIR = "/home/yuque3/nwy/real-t/spk_emb_models/cnceleb_resnet34_LM"
-        en_encoder_path  = cfg.get("spk_encoder_en_path",  _DEFAULT_EN_SPK_DIR)  or _DEFAULT_EN_SPK_DIR
-        chs_encoder_path = cfg.get("spk_encoder_chs_path", _DEFAULT_CHS_SPK_DIR) or _DEFAULT_CHS_SPK_DIR
-        if not os.path.isabs(en_encoder_path):
-            en_encoder_path  = resolve_path(en_encoder_path,  _SCRIPT_DIR)
-        if not os.path.isabs(chs_encoder_path):
-            chs_encoder_path = resolve_path(chs_encoder_path, _SCRIPT_DIR)
+        encoder_paths = resolve_spk_encoder_paths(cfg)
+        missing = [l for l in train_dataset.languages() if l not in encoder_paths]
+        if missing:
+            raise ValueError(
+                f"[Loss] training data has languages {missing} without a speaker encoder; "
+                f"add them under spk_encoders in the config (configured: {sorted(encoder_paths)})"
+            )
         margin = cfg.get("sim_margin", 0.2)
-        en_encoder  = FrozenSpeakerEncoder(en_encoder_path,  device=str(device)).to(device)
-        chs_encoder = FrozenSpeakerEncoder(chs_encoder_path, device=str(device)).to(device)
-        spk_loss_fn = SpeakerSimilarityLoss(
-            en_encoder=en_encoder, chs_encoder=chs_encoder, margin=margin
-        )
+        by_path: Dict[str, FrozenSpeakerEncoder] = {}   # languages sharing a model share one instance
+        encoders: Dict[str, FrozenSpeakerEncoder] = {}
+        for lang, path in encoder_paths.items():
+            if path not in by_path:
+                by_path[path] = FrozenSpeakerEncoder(path, device=str(device)).to(device)
+            encoders[lang] = by_path[path]
+        spk_loss_fn = SpeakerSimilarityLoss(encoders=encoders, margin=margin)
         if is_main:
             logger.info(
-                f"[Loss] 启用说话人相似度 Ranking Loss (双编码器): "
-                f"margin={margin}, en={en_encoder_path}, chs={chs_encoder_path}"
+                f"[Loss] 启用说话人相似度 Ranking Loss: margin={margin}, encoders="
+                + ", ".join(f"{l}={p}" for l, p in encoder_paths.items())
             )
 
-    # ── 目标说话人活动检测 Loss（combined 模式且 lambda_vad > 0 时加载）──
+    # ── Target speaker VAD loss (combined mode with lambda_vad > 0) ──────
     vad_loss_fn = None
     lambda_vad = cfg.get("lambda_vad", 0.5)
     if loss_mode == "combined" and lambda_vad > 0:
@@ -1978,16 +2128,19 @@ def main():
             sample_rate=data_cfg.get("sample_rate", 16000),
             frame_shift_ms=vad_frame_shift_ms,
             frame_length_ms=vad_frame_length_ms,
+            threshold_db=cfg.get("vad_threshold_db", -40.0),
+            slope_db=cfg.get("vad_slope_db", 5.0),
         )
         if is_main:
             logger.info(
                 f"[Loss] 启用目标说话人活动检测 Loss: "
                 f"lambda_vad={lambda_vad}, "
                 f"frame_shift={vad_frame_shift_ms}ms, "
-                f"frame_length={vad_frame_length_ms}ms"
+                f"frame_length={vad_frame_length_ms}ms, "
+                f"threshold={vad_loss_fn.threshold_db}dB, slope={vad_loss_fn.slope_db}dB"
             )
 
-    # ── 可微分 DNSMOS Loss（combined 模式且 lambda_dnsmos > 0 时加载）──────
+    # ── Differentiable DNSMOS loss (combined mode with lambda_dnsmos > 0) ─
     dnsmos_loss_fn = None
     lambda_dnsmos = cfg.get("lambda_dnsmos", 0.0)
     if loss_mode == "combined" and lambda_dnsmos > 0:
@@ -2021,7 +2174,7 @@ def main():
                 logger.warning(f"[Loss] DNSMOSLoss 初始化失败，跳过: {e}")
                 dnsmos_loss_fn = None
 
-    # ── 优化器 ────────────────────────────────────────────────────────────
+    # ── Optimizer ─────────────────────────────────────────────────────────
     opt_cfg = cfg.get("optimizer", {"lr": 1e-5, "weight_decay": 1e-5})
     optimizer = torch.optim.AdamW(
         filter(lambda p: p.requires_grad, tse_model.parameters()),
@@ -2031,7 +2184,7 @@ def main():
     if is_main:
         logger.info(f"优化器: AdamW, lr={opt_cfg.get('lr', 1e-5):.1e}")
 
-    # ── 学习率调度器 ──────────────────────────────────────────────────────
+    # ── Learning-rate scheduler ───────────────────────────────────────────
     sch_cfg    = cfg.get("scheduler_args", {})
     num_epochs = cfg.get("num_epochs", 50)
     epoch_iter = max(len(dataloader), 1)
@@ -2051,7 +2204,7 @@ def main():
             f"lr: {sch_cfg.get('initial_lr', 1e-5):.1e} -> {sch_cfg.get('final_lr', 1e-6):.1e}"
         )
 
-    # ── 恢复训练 ──────────────────────────────────────────────────────────
+    # ── Resume ────────────────────────────────────────────────────────────
     start_epoch = 1
     global_step = 0
     best_loss   = float("inf")
@@ -2059,12 +2212,12 @@ def main():
     resume_path = cfg.get("resume", None)
     if resume_path and resume_path != "null":
         resume_path = resolve_path(resume_path, _SCRIPT_DIR)
-        # 取原始 module（DDP 包装前）
+        # Unwrapped module (before DDP)
         raw_model = tse_model.module if world_size > 1 else tse_model
-        global_step, start_epoch, best_loss = load_checkpoint(
+        global_step, saved_epoch, best_loss, epoch_finished = load_checkpoint(
             resume_path, raw_model, optimizer, scheduler
         )
-        start_epoch = resolve_resume_epoch(start_epoch)
+        start_epoch = resolve_resume_epoch(saved_epoch, epoch_finished)
 
     cfg["_best_loss"] = best_loss
     eval_state: Dict = {}
@@ -2078,9 +2231,9 @@ def main():
             f"skip_if_running={bool(cfg.get('epoch_eval_skip_if_running', True))}"
         )
 
-    # ── 训练循环 ──────────────────────────────────────────────────────────
+    # ── Training loop ─────────────────────────────────────────────────────
     for epoch in range(start_epoch, num_epochs + 1):
-        # DDP: 每 epoch 设置 sampler 的 epoch（保证打乱顺序不同）
+        # DDP: set the sampler epoch so each epoch is shuffled differently
         if sampler is not None:
             sampler.set_epoch(epoch)
 
@@ -2115,7 +2268,7 @@ def main():
             if writer is not None:
                 writer.add_scalar("train/epoch_loss", epoch_loss, epoch)
 
-            # 保存 best model（仅 rank0，取 module 的 state_dict）
+            # Save the best model (rank 0 only, using the module's state_dict)
             raw_model = tse_model.module if world_size > 1 else tse_model
             if epoch_loss < best_loss:
                 best_loss = epoch_loss
@@ -2129,6 +2282,7 @@ def main():
                     optimizer=optimizer,
                     scheduler=scheduler,
                     best_loss=best_loss,
+                    epoch_finished=True,
                 )
                 logger.info(f"[Best] epoch={epoch} loss={best_loss:.4f} -> {best_path.name}")
 
@@ -2140,6 +2294,7 @@ def main():
                 optimizer=optimizer,
                 scheduler=scheduler,
                 best_loss=best_loss,
+                epoch_finished=True,
             )
             eval_state = launch_async_epoch_eval(
                 epoch=epoch,
@@ -2149,7 +2304,7 @@ def main():
                 cfg=cfg,
             )
         
-        # 所有 rank 同步（避免慢卡影响 checkpoint 写入）
+        # Sync all ranks (so slow ranks don't race checkpoint writing)
         if world_size > 1:
             dist.barrier()
 

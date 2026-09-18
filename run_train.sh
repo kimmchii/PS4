@@ -85,6 +85,7 @@ done
 
 CONFIG_FILE=""
 RESUME_CKPT=""
+INIT_CKPT=""
 EXP_DIR_OVERRIDE=""
 
 if [[ "$IS_NAME" -eq 1 ]]; then
@@ -140,13 +141,15 @@ else
         echo "[ERROR] $MODEL/models 下未找到 .pt checkpoint"
         exit 1
     fi
-    RESUME_CKPT="$LATEST_CKPT"
 
     if [[ "$RESUME" -eq 1 ]]; then
         # 原地继续训练：传入 exp_dir 防止生成新时间戳目录
+        RESUME_CKPT="$LATEST_CKPT"
         EXP_DIR_OVERRIDE="$MODEL"
         echo "[INFO] resume 模式：原地继续实验目录 $MODEL"
     else
+        # finetune: load model weights only; optimizer/scheduler/epoch start fresh
+        INIT_CKPT="$LATEST_CKPT"
         echo "[INFO] finetune 模式：从 $LATEST_CKPT 初始化，创建新实验目录"
     fi
     echo "[INFO] 加载 checkpoint: $LATEST_CKPT"
@@ -187,6 +190,7 @@ echo "  GPU 编号  : ${GPUS:-auto}"
 echo "  GPU 数量  : $NUM_GPUS"
 [[ -n "$EXP_DIR_OVERRIDE" ]] && echo "  实验目录  : $EXP_DIR_OVERRIDE"
 [[ -n "$RESUME_CKPT"      ]] && echo "  Resume    : $RESUME_CKPT"
+[[ -n "$INIT_CKPT"        ]] && echo "  Init      : $INIT_CKPT"
 echo "  启动时间  : $(date '+%Y-%m-%d %H:%M:%S')"
 echo "============================================================"
 
@@ -194,6 +198,7 @@ echo "============================================================"
 TRAIN_ARGS=(--config "$CONFIG_FILE")
 [[ -n "$EXP_DIR_OVERRIDE" ]] && TRAIN_ARGS+=(--exp_dir "$EXP_DIR_OVERRIDE")
 [[ -n "$RESUME_CKPT"      ]] && TRAIN_ARGS+=(--resume  "$RESUME_CKPT")
+[[ -n "$INIT_CKPT"        ]] && TRAIN_ARGS+=(--pretrained_tse "$INIT_CKPT")
 
 # ── 启动训练 ─────────────────────────────────────────────────────────────
 if [[ "$NUM_GPUS" -le 1 ]]; then

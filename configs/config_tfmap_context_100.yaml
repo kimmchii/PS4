@@ -70,6 +70,8 @@ data:
 
   # 音频参数
   sample_rate: 16000
+  # Peak-normalize mixture and enrollment to [-1, 1] (matches inference.py)
+  peak_normalize: true
 
   # mixture 最大音频长度（采样点数，超过的样本在加载时直接跳过）
   # Whisper 只能处理 30s 音频（480000 采样点 @ 16kHz），超长样本会被过滤
