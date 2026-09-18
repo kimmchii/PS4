@@ -248,6 +248,94 @@ def _peak_normalize(wav: torch.Tensor) -> torch.Tensor:
     return wav / peak if peak > 0 else wav
 
 
+def _parse_enroll_crop(value) -> Optional[Tuple[float, float]]:
+    """data.enroll_crop: null / [] = off, else [min_s, max_s] with 0 < min_s <= max_s."""
+    if not value:
+        return None
+    if not isinstance(value, (list, tuple)) or len(value) != 2:
+        raise ValueError(f"data.enroll_crop must be [min_seconds, max_seconds] or null, got {value!r}")
+    lo, hi = float(value[0]), float(value[1])
+    if not 0 < lo <= hi:
+        raise ValueError(f"data.enroll_crop needs 0 < min <= max, got {value!r}")
+    return lo, hi
+
+
+class NoiseBank:
+    """Background-noise clips (wav/flac under the given dirs); a random segment is read per use."""
+
+    def __init__(self, dirs: List[str], sample_rate: int):
+        self.files = sorted(str(f) for d in dirs for f in Path(d).rglob("*")
+                            if f.suffix.lower() in (".wav", ".flac"))
+        if not self.files:
+            raise ValueError(f"no .wav/.flac noise files found under {dirs}")
+        self.sample_rate = sample_rate
+        logging.info(f"[Noise] {len(self.files)} noise clips from {dirs}")
+
+    def sample(self, n: int) -> torch.Tensor:
+        """A random n-sample noise segment (the clip is looped if shorter)."""
+        wav, sr = torchaudio.load(random.choice(self.files))
+        wav = wav.mean(0)
+        if sr != self.sample_rate:
+            wav = torchaudio.functional.resample(wav, sr, self.sample_rate)
+        if wav.numel() == 0:
+            return torch.zeros(n)
+        if wav.shape[0] < n:
+            wav = wav.repeat(n // wav.shape[0] + 1)
+        start = random.randint(0, wav.shape[0] - n)
+        return wav[start: start + n]
+
+
+def _parse_noise_augment(cfg, sample_rate: int, key: str) -> Optional[Dict]:
+    """{noise_dirs, prob, snr_db: [lo, hi]} -> settings with a NoiseBank; null = off."""
+    if not cfg:
+        return None
+    dirs = cfg.get("noise_dirs") or cfg.get("noise_dir")
+    if isinstance(dirs, str):
+        dirs = [dirs]
+    prob = float(cfg.get("prob", 0.5))
+    snr = cfg.get("snr_db", [5.0, 20.0])
+    if not dirs:
+        raise ValueError(f"{key}.noise_dirs is required")
+    if not 0.0 <= prob <= 1.0:
+        raise ValueError(f"{key}.prob must be in [0, 1], got {prob}")
+    if not isinstance(snr, (list, tuple)) or len(snr) != 2 or float(snr[0]) > float(snr[1]):
+        raise ValueError(f"{key}.snr_db must be [low, high], got {snr!r}")
+    return {"prob": prob, "snr_db": (float(snr[0]), float(snr[1])),
+            "noise": NoiseBank([resolve_path(d, _SCRIPT_DIR) for d in dirs], sample_rate)}
+
+
+def _add_noise(clean: torch.Tensor, noise: torch.Tensor, snr_lo: float, snr_hi: float) -> torch.Tensor:
+    """Add noise at a random SNR (dB) in [snr_lo, snr_hi], relative to the clean signal's power."""
+    p_clean, p_noise = clean.pow(2).mean(), noise.pow(2).mean()
+    if p_clean <= 1e-12 or p_noise <= 1e-12:
+        return clean
+    snr = random.uniform(snr_lo, snr_hi)
+    return clean + noise * torch.sqrt(p_clean / (p_noise * 10 ** (snr / 10)))
+
+
+def _speech_region(wav: torch.Tensor, sr: int, floor_db: float = 35.0, frame_ms: float = 20.0) -> Tuple[int, int]:
+    """(start, end) samples of the region above (loudest 20 ms frame - floor_db)."""
+    hop = max(1, int(sr * frame_ms / 1000))
+    n = wav.shape[0] // hop
+    if n == 0:
+        return 0, wav.shape[0]
+    db = 10 * torch.log10(wav[: n * hop].reshape(n, hop).pow(2).mean(dim=1) + 1e-12)
+    idx = torch.nonzero(db > db.max() - floor_db).flatten()
+    if idx.numel() == 0:
+        return 0, wav.shape[0]
+    return int(idx[0]) * hop, min(wav.shape[0], (int(idx[-1]) + 1) * hop)
+
+
+def _random_speech_crop(wav: torch.Tensor, sr: int, min_s: float, max_s: float) -> torch.Tensor:
+    """Random min_s-max_s window inside the speech region; the whole region if it is shorter."""
+    start, end = _speech_region(wav, sr)
+    n = int(random.uniform(min_s, max_s) * sr)
+    if end - start > n:
+        start += random.randint(0, end - start - n)
+        end = start + n
+    return wav[start:end]
+
+
 class TSEASRDataset(Dataset):
     """
     TSE-ASR training dataset
@@ -279,10 +367,14 @@ class TSEASRDataset(Dataset):
         max_samples: int = 0,
         load_vad_labels: bool = True,
         peak_normalize: bool = True,
+        enroll_crop: Optional[List[float]] = None,
+        enroll_augment: Optional[Dict] = None,
     ):
         super().__init__()
         self.sample_rate = sample_rate
         self.peak_normalize = peak_normalize
+        self.enroll_crop = _parse_enroll_crop(enroll_crop)
+        self.enroll_augment = _parse_noise_augment(enroll_augment, sample_rate, "data.enroll_augment")
         self.max_mix_len = max_mix_len
         self.max_enroll_len = max_enroll_len
         self.min_transcript_len = min_transcript_len
@@ -471,11 +563,22 @@ class TSEASRDataset(Dataset):
         mix_wav    = mix_wav.squeeze(0)      # [T]
         enroll_wav = enroll_wav.squeeze(0)   # [T_e]
 
+        # Random enrollment crop (a new one each time the sample is loaded)
+        if self.enroll_crop is not None:
+            enroll_wav = _random_speech_crop(enroll_wav, self.sample_rate, *self.enroll_crop)
+
+        # Noisy enrollment for the model input; the similarity loss keeps the clean one
+        enroll_clean = enroll_wav
+        aug = self.enroll_augment
+        if aug is not None and random.random() < aug["prob"]:
+            enroll_wav = _add_noise(enroll_wav, aug["noise"].sample(enroll_wav.shape[0]), *aug["snr_db"])
+
         # Peak-normalize to [-1, 1], same as inference.py's load_audio, so the
         # level-sensitive losses (VAD, DNSMOS) see the levels used at inference.
         if self.peak_normalize:
-            mix_wav    = _peak_normalize(mix_wav)
-            enroll_wav = _peak_normalize(enroll_wav)
+            mix_wav      = _peak_normalize(mix_wav)
+            enroll_wav   = _peak_normalize(enroll_wav)
+            enroll_clean = _peak_normalize(enroll_clean)
 
         # Drop over-long mixtures
         if self.max_mix_len > 0 and mix_wav.shape[0] > self.max_mix_len:
@@ -483,14 +586,18 @@ class TSEASRDataset(Dataset):
 
         # Truncate over-long enrollments
         if self.max_enroll_len > 0 and enroll_wav.shape[0] > self.max_enroll_len:
-            enroll_wav = enroll_wav[: self.max_enroll_len]
+            enroll_wav   = enroll_wav[: self.max_enroll_len]
+            enroll_clean = enroll_clean[: self.max_enroll_len]
 
         return {
             "mixture":      mix_wav,        # [T]
-            "enroll":       enroll_wav,     # [T_e]
+            "enroll":       enroll_wav,     # [T_e] model input (possibly noisy)
+            "enroll_clean": enroll_clean,   # [T_e] reference for the similarity loss
             "transcript":   transcript,     # str
             "language":     language,       # language code, e.g. 'zh' / 'en' / 'th'
             "vad_segments": vad_segments,   # List[[start, end]] or None
+            "mix_path":     mix_path,
+            "enroll_path":  enroll_path,
         }
 
 
@@ -498,12 +605,13 @@ def tse_asr_collate_fn(batch: List) -> Optional[Dict]:
     """
     Pad and assemble a batch, dropping None samples.
     Returns:
-        mixture:  [B, T_max]  (zero-padded)
-        enroll:   [B, T_e_max]
-            mix_lens: [B]  real lengths (samples)
-        transcripts: List[str]
-            languages:   List[str]  language of each sample
-            vad_segments: List[Optional[List[[start, end]]]]  target speaker VAD labels
+        mixture:      [B, T_max]  (zero-padded)
+        enroll:       [B, T_e_max]  model input (possibly noisy)
+        enroll_clean: [B, T_e_max]  clean enrollment for the similarity loss
+        mix_lens:     [B]  real lengths (samples)
+        transcripts:  List[str]
+        languages:    List[str]  language of each sample
+        vad_segments: List[Optional[List[[start, end]]]]  target speaker VAD labels
     """
     batch = [b for b in batch if b is not None]
     if len(batch) == 0:
@@ -511,24 +619,31 @@ def tse_asr_collate_fn(batch: List) -> Optional[Dict]:
 
     mix_wavs      = [b["mixture"]    for b in batch]
     enroll_wavs   = [b["enroll"]     for b in batch]
+    enroll_cleans = [b.get("enroll_clean", b["enroll"]) for b in batch]
     transcripts   = [b["transcript"] for b in batch]
     languages     = [b["language"] for b in batch]   # every sample must have a language field
     vad_segments  = [b.get("vad_segments", None) for b in batch]
+    mix_paths     = [b.get("mix_path") for b in batch]
+    enroll_paths  = [b.get("enroll_path") for b in batch]
 
     mix_lens    = torch.tensor([w.shape[0] for w in mix_wavs], dtype=torch.long)
     enroll_lens = torch.tensor([w.shape[0] for w in enroll_wavs], dtype=torch.long)
 
     mixture = torch.nn.utils.rnn.pad_sequence(mix_wavs,    batch_first=True)
     enroll  = torch.nn.utils.rnn.pad_sequence(enroll_wavs, batch_first=True)
+    enroll_clean = torch.nn.utils.rnn.pad_sequence(enroll_cleans, batch_first=True)
 
     return {
         "mixture":      mixture,       # [B, T_max]
         "enroll":       enroll,        # [B, T_e_max]
+        "enroll_clean": enroll_clean,  # [B, T_e_max]
         "mix_lens":     mix_lens,      # [B]
         "enroll_lens":  enroll_lens,   # [B]
         "transcripts":  transcripts,   # List[str]
         "languages":    languages,     # List[str], language of each sample
         "vad_segments": vad_segments,  # List[Optional[List[[start,end]]]]
+        "mix_paths":    mix_paths,     # List[str], source files (for debugging)
+        "enroll_paths": enroll_paths,  # List[str]
     }
 
 
@@ -1347,6 +1462,41 @@ def run_tse_forward(
     return tse_out
 
 
+def save_debug_batch(batch: Dict, out_dir: str, epoch: int, step: int, rank: int,
+                     sample_rate: int, limit: int) -> int:
+    """
+    Write the model inputs of up to `limit` samples of a batch to
+    <out_dir>/e<epoch>_s<step>_r<rank>_b<i>/: mixture.wav, enroll.wav (model input,
+    possibly cropped/noisy), enroll_clean.wav (similarity-loss reference) and meta.json.
+    Returns the number of samples written.
+    """
+    import soundfile as sf
+
+    enroll_clean = batch.get("enroll_clean", batch["enroll"])
+    n = min(limit, batch["mixture"].shape[0])
+    for i in range(n):
+        d = Path(out_dir) / f"e{epoch:03d}_s{step:07d}_r{rank}_b{i}"
+        d.mkdir(parents=True, exist_ok=True)
+        mix_len, enr_len = int(batch["mix_lens"][i]), int(batch["enroll_lens"][i])
+        for name, wav, length in [("mixture", batch["mixture"][i], mix_len),
+                                  ("enroll", batch["enroll"][i], enr_len),
+                                  ("enroll_clean", enroll_clean[i], enr_len)]:
+            sf.write(str(d / f"{name}.wav"), wav[:length].float().cpu().numpy(), sample_rate, subtype="FLOAT")
+        meta = {
+            "epoch": epoch, "step": step, "rank": rank,
+            "transcript": batch["transcripts"][i],
+            "language": (batch.get("languages") or [None] * (i + 1))[i],
+            "vad_segments": (batch.get("vad_segments") or [None] * (i + 1))[i],
+            "mixture_seconds": round(mix_len / sample_rate, 3),
+            "enroll_seconds": round(enr_len / sample_rate, 3),
+            "enroll_is_augmented": not torch.equal(batch["enroll"][i], enroll_clean[i]),
+            "mix_path": (batch.get("mix_paths") or [None] * (i + 1))[i],
+            "enroll_path": (batch.get("enroll_paths") or [None] * (i + 1))[i],
+        }
+        (d / "meta.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+    return n
+
+
 def train_one_epoch(
     tse_model:    nn.Module,
     asr_model:    Optional[FrozenWhisperASR],
@@ -1424,6 +1574,10 @@ def train_one_epoch(
     epoch_loss_sum = 0.0
     epoch_batches  = 0
     best_loss    = cfg.get("_best_loss", float("inf"))
+    debug_dir    = cfg.get("save_debug")                  # None = off
+    debug_max    = int(cfg.get("save_debug_max", 50))      # per rank, across epochs
+    debug_sr     = cfg.get("data", {}).get("sample_rate", 16000)
+    cfg.setdefault("_debug_saved", 0)
 
     # Progress bar on rank 0 only
     pbar = tqdm(dataloader, desc=f"Epoch {epoch}", dynamic_ncols=True, leave=False,
@@ -1435,11 +1589,20 @@ def train_one_epoch(
             continue
 
         mixture      = batch["mixture"].to(device)       # [B, T]
-        enroll       = batch["enroll"].to(device)        # [B, T_e]
+        enroll       = batch["enroll"].to(device)        # [B, T_e] model input (possibly noisy)
+        enroll_ref   = batch.get("enroll_clean", batch["enroll"]).to(device)  # clean, for the similarity loss
         mix_lens     = batch["mix_lens"].to(device)      # [B]
         transcripts  = batch["transcripts"]              # List[str]
         languages    = batch.get("languages", None)      # List[str] or None
         vad_segments = batch.get("vad_segments", None)   # List[Optional[List]]
+
+        # Save the exact training inputs for inspection; done before the forward
+        # pass so the input of a step that crashes (e.g. out of memory) is kept too
+        if debug_dir and cfg["_debug_saved"] < debug_max:
+            cfg["_debug_saved"] += save_debug_batch(
+                batch, debug_dir, epoch, global_step, get_rank(), debug_sr,
+                limit=debug_max - cfg["_debug_saved"],
+            )
 
         optimizer.zero_grad()
 
@@ -1470,7 +1633,7 @@ def train_one_epoch(
         if loss_mode in ("similarity", "combined") and spk_loss_fn is not None:
             try:
                 sim_loss, sim_tse_enroll_mean, sim_mix_enroll_mean = spk_loss_fn(
-                    tse_out, mixture, enroll,
+                    tse_out, mixture, enroll_ref,
                     languages=languages if languages is not None else ["en"] * tse_out.shape[0],
                 )
             except Exception as e:
@@ -1896,6 +2059,12 @@ def main():
         help="Initialize model weights only from this checkpoint (overrides pretrained_tse in config; optimizer/step/epoch are not restored)",
     )
     parser.add_argument(
+        "--save_debug",
+        type=str, default=None,
+        help="Directory to save training inputs (mixture, enrollment, metadata) for inspection "
+             "(overrides save_debug in the config; see save_debug_max)",
+    )
+    parser.add_argument(
         "--max_samples",
         type=int, default=None,
         help="Maximum number of training samples (overrides the config)",
@@ -1917,6 +2086,9 @@ def main():
     if args.exp_dir     is not None: cfg["exp_dir"]              = args.exp_dir
     if args.pretrained_tse is not None: cfg["pretrained_tse"]    = args.pretrained_tse
     if args.max_samples is not None: cfg["data"]["max_samples"]  = args.max_samples
+    if args.save_debug  is not None: cfg["save_debug"]           = args.save_debug
+    if cfg.get("save_debug"):
+        cfg["save_debug"] = resolve_path(cfg["save_debug"], _SCRIPT_DIR)
 
     # Timestamped experiment dir (rank 0 creates the timestamp and broadcasts it to all ranks)
     exp_dir_raw = cfg.get("exp_dir", "exp/tse_asr")
@@ -1969,6 +2141,9 @@ def main():
             f"{amp_dtype if cfg.get('enable_amp', False) and amp_dtype is not None else 'float32 (AMP off)'}"
         )
         logger.info(f"Config file: {args.config}")
+        if cfg.get("save_debug"):
+            logger.info(f"[Debug] saving up to {cfg.get('save_debug_max', 50)} training inputs per rank "
+                        f"to {cfg['save_debug']}")
         logger.info(f"Distributed training: world_size={world_size}")
 
         config_save_path = Path(exp_dir_abs) / "config.yaml"
@@ -2021,6 +2196,8 @@ def main():
         min_transcript_len = data_cfg.get("min_transcript_len", 2),
         max_samples        = data_cfg.get("max_samples", 0),
         peak_normalize     = data_cfg.get("peak_normalize", True),
+        enroll_crop        = data_cfg.get("enroll_crop"),
+        enroll_augment     = data_cfg.get("enroll_augment"),
     )
     if len(train_dataset) == 0:
         raise ValueError(

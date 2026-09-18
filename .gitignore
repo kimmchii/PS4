@@ -26,3 +26,6 @@ Thumbs.db
 # 环境
 .env
 *.log
+
+# Training input dumps (save_debug)
+debug/

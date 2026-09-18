@@ -125,6 +125,22 @@ data:
   # Maximum enrollment truncation length in samples (0 = no truncation)
   max_enroll_len: 160000  # 10 s
 
+  # Random enrollment crop [min_s, max_s]: a new random window inside the enrollment's
+  # speech region each time a sample is loaded (the whole region if shorter); null = off.
+  # e.g. enroll_crop: [3.0, 8.0]
+  enroll_crop: [0.6, 5.0]
+
+  # Background noise added to the enrollment fed to the model (the speaker similarity loss
+  # still uses the clean enrollment); null = off. Example:
+  #   enroll_augment:
+  #     noise_dirs: [/path/to/noise]   # .wav/.flac, searched recursively
+  #     prob: 0.5                      # chance that an enrollment gets noise
+  #     snr_db: [5, 20]                # speech-to-noise ratio range (dB)
+  enroll_augment:
+    noise_dirs: [/mnt/data/speakers/monomax_noise]
+    prob: 0.5
+    snr_db: [5, 20]
+
   # Skip samples whose transcript is shorter than this (in characters)
   min_transcript_len: 2
 
@@ -143,6 +159,12 @@ clip_grad: 5.0
 
 # Logging interval (in steps)
 log_every: 100
+
+# Save training inputs for inspection: mixture.wav, enroll.wav (model input after crop /
+# noise), enroll_clean.wav and meta.json per sample, under <save_debug>/e<epoch>_s<step>_r<rank>_b<i>/.
+# null = off. Also settable with --save_debug PATH. Relative paths resolve against the repo dir.
+save_debug: ./debug/tse
+save_debug_max: 50       # max samples saved per rank (whole run)
 
 # ── Loss mode and weights ─────────────────────────────────────
 #
