@@ -110,7 +110,7 @@ class DNSMOSLoss(nn.Module):
     ):
         super().__init__()
         assert target_metric in ("OVRL", "SIG", "BAK", "P808"), (
-            f"target_metric 必须是 OVRL/SIG/BAK/P808，得到 {target_metric!r}"
+            f"target_metric must be OVRL/SIG/BAK/P808, got {target_metric!r}"
         )
         self.target_metric = target_metric
         self._len_samples = int(self._INPUT_LEN * self._SR)
@@ -293,12 +293,12 @@ class TSEASRDataset(Dataset):
             before = len(self.samples)
             self._load_data(root, datasets, dataset_subdirs)
             added = len(self.samples) - before
-            logging.info(f"[Dataset] 数据根目录 {root} 新增 {added} 条样本")
+            logging.info(f"[Dataset] data root {root}: added {added} samples")
 
         if max_samples > 0:
             self.samples = self.samples[:max_samples]
 
-        logging.info(f"[Dataset] 共加载 {len(self.samples)} 条样本")
+        logging.info(f"[Dataset] loaded {len(self.samples)} samples in total")
 
     def _load_vad_index(
         self,
@@ -315,7 +315,7 @@ class TSEASRDataset(Dataset):
             subdir = dataset_subdir(ds_name, dataset_subdirs)
             vad_file = Path(train_root) / subdir / "TRAIN" / "target_activity_segments.jsonl"
             if not vad_file.exists():
-                logging.warning(f"[Dataset] VAD 标签文件不存在: {vad_file}")
+                logging.warning(f"[Dataset] VAD label file not found: {vad_file}")
                 continue
             cnt = 0
             with open(vad_file, "r", encoding="utf-8") as f:
@@ -327,7 +327,7 @@ class TSEASRDataset(Dataset):
                     key = (rec["mixture_utterance"], rec["speaker"])
                     vad_index[key] = rec["segments"]
                     cnt += 1
-            logging.info(f"[Dataset] VAD 标签: {ds_name} 加载 {cnt} 条")
+            logging.info(f"[Dataset] VAD labels: {ds_name} loaded {cnt}")
         return vad_index
 
     def _load_data(
@@ -351,10 +351,10 @@ class TSEASRDataset(Dataset):
             meta_csv    = ds_root / "TRAIN" / f"{ds_name}_meta.csv"
 
             if not mapping_csv.exists():
-                logging.warning(f"[Dataset] mapping.csv 不存在: {mapping_csv}，跳过")
+                logging.warning(f"[Dataset] mapping.csv not found: {mapping_csv}, skipping")
                 continue
             if not meta_csv.exists():
-                logging.warning(f"[Dataset] meta.csv 不存在: {meta_csv}，跳过")
+                logging.warning(f"[Dataset] meta CSV not found: {meta_csv}, skipping")
                 continue
 
             # Load the path mapping (mixture audio only)
@@ -436,7 +436,7 @@ class TSEASRDataset(Dataset):
                 cnt_ok += 1
 
             logging.info(
-                f"[Dataset] {ds_name}: 加载 {cnt_ok} 条，跳过 {cnt_skip} 条, "
+                f"[Dataset] {ds_name}: loaded {cnt_ok}, skipped {cnt_skip}, "
                 f"missing audio {cnt_missing}"
             )
 
@@ -453,7 +453,7 @@ class TSEASRDataset(Dataset):
             mix_wav,    sr_m = torchaudio.load(mix_path)
             enroll_wav, sr_e = torchaudio.load(enroll_path)
         except Exception as e:
-            logging.warning(f"[Dataset] 音频加载失败 idx={idx}: {e}")
+            logging.warning(f"[Dataset] failed to load audio idx={idx}: {e}")
             return None
 
         # Resample
@@ -556,14 +556,14 @@ def build_tse_model(cfg: Dict, pretrained_path: Optional[str] = None) -> nn.Modu
         if not os.path.isabs(smi):
             smi_abs = str((Path(_SCRIPT_DIR) / smi).resolve())
             model_args["spk_model_init"] = smi_abs
-            logging.info(f"[TSE] spk_model_init 解析为: {smi_abs}")
+            logging.info(f"[TSE] spk_model_init resolved to: {smi_abs}")
 
     model_cls = get_model(model_name)
     model = model_cls(**model_args)  # unpack the dict as keyword arguments
 
     if pretrained_path is not None and pretrained_path != "null":
         pretrained_path = str(Path(_SCRIPT_DIR) / pretrained_path)
-        logging.info(f"[TSE] 从预训练权重加载: {pretrained_path}")
+        logging.info(f"[TSE] loading pretrained weights: {pretrained_path}")
         ckpt = torch.load(pretrained_path, map_location="cpu")
         # Support several checkpoint formats
         # wesep training format: {"models": [state_dict], "optimizers": [...], ...}
@@ -612,7 +612,7 @@ class FrozenWhisperASR(nn.Module):
         super().__init__()
         from transformers import WhisperForConditionalGeneration, WhisperTokenizer, WhisperConfig
 
-        logging.info(f"[ASR] 加载 Whisper 模型 (transformers): {model_path}")
+        logging.info(f"[ASR] loading Whisper model (transformers): {model_path}")
         self.hf_model = WhisperForConditionalGeneration.from_pretrained(
             model_path,
             dtype=torch.float32,
@@ -639,7 +639,7 @@ class FrozenWhisperASR(nn.Module):
         )  # [n_freqs, n_mels]
         self.register_buffer("mel_fb", mel_fb)  # no gradient; moves with .to(device)
 
-        logging.info(f"[ASR] Whisper 参数已冻结，mel_bins={self.N_MELS}")
+        logging.info(f"[ASR] Whisper parameters frozen, mel_bins={self.N_MELS}")
 
     def check_languages(self, languages: List[str]):
         """Fail early if a language has no Whisper token (it would silently map to <unk>)."""
@@ -851,9 +851,9 @@ class FrozenSpeakerEncoder(nn.Module):
         model_path  = model_dir / "avg_model.pt"
 
         if not config_path.exists():
-            raise FileNotFoundError(f"[SpeakerEncoder] config.yaml 不存在: {config_path}")
+            raise FileNotFoundError(f"[SpeakerEncoder] config.yaml not found: {config_path}")
         if not model_path.exists():
-            raise FileNotFoundError(f"[SpeakerEncoder] avg_model.pt 不存在: {model_path}")
+            raise FileNotFoundError(f"[SpeakerEncoder] avg_model.pt not found: {model_path}")
 
         with open(config_path, "r", encoding="utf-8") as f:
             spk_cfg = _yaml.safe_load(f)
@@ -902,7 +902,7 @@ class FrozenSpeakerEncoder(nn.Module):
             )
 
         logging.info(
-            f"[SpeakerEncoder] 已加载并冻结 {spk_model_name}: {model_path}  "
+            f"[SpeakerEncoder] loaded and froze {spk_model_name}: {model_path}  "
             f"fbank: n_mels={self.num_mel_bins}, frame_length={self.frame_length}ms, "
             f"frame_shift={self.frame_shift}ms"
         )
@@ -1288,7 +1288,7 @@ def load_checkpoint(
     """
     Returns (step, epoch, best_loss, epoch_finished)
     """
-    logging.info(f"[Ckpt] 从 {path} 恢复训练")
+    logging.info(f"[Ckpt] resuming training from {path}")
     ckpt = torch.load(path, map_location="cpu")
     tse_model.load_state_dict(ckpt["model"])
     if optimizer is not None and "optimizer" in ckpt:
@@ -1314,7 +1314,7 @@ def rotate_checkpoints(ckpt_dir: str, max_keep: int):
     if len(ckpts) > max_keep:
         for old in ckpts[: len(ckpts) - max_keep]:
             old.unlink()
-            logging.debug(f"[Ckpt] 删除旧 checkpoint: {old.name}")
+            logging.debug(f"[Ckpt] deleted old checkpoint: {old.name}")
 
 
 # ===========================================================================
@@ -1393,16 +1393,16 @@ def train_one_epoch(
     # Validate the loss mode
     valid_modes = ("ce", "similarity", "combined")
     if loss_mode not in valid_modes:
-        raise ValueError(f"[Train] 无效 loss_mode={loss_mode!r}，合法值: {valid_modes}")
+        raise ValueError(f"[Train] invalid loss_mode={loss_mode!r}, valid values: {valid_modes}")
     if loss_mode in ("similarity", "combined") and spk_loss_fn is None:
         raise ValueError(
-            f"[Train] loss_mode={loss_mode!r} 需要 spk_loss_fn，"
-            "请在 config 中配置 spk_encoder_path"
+            f"[Train] loss_mode={loss_mode!r} needs spk_loss_fn; "
+            "set spk_encoders in the config"
         )
     if loss_mode in ("ce", "combined") and asr_model is None:
         raise ValueError(
-            f"[Train] loss_mode={loss_mode!r} 需要 asr_model，"
-            "请在 config 中配置 whisper_model_path"
+            f"[Train] loss_mode={loss_mode!r} needs asr_model; "
+            "set whisper_model_path in the config"
         )
 
     amp_dtype     = parse_amp_dtype(cfg.get("amp_dtype", "float32"))
@@ -1474,7 +1474,7 @@ def train_one_epoch(
                     languages=languages if languages is not None else ["en"] * tse_out.shape[0],
                 )
             except Exception as e:
-                logger.warning(f"[Train] spk sim loss 计算失败: {e}")
+                logger.warning(f"[Train] speaker similarity loss failed: {e}")
                 sim_loss = torch.tensor(0.0, device=device)
 
         # ── 3.5. Target speaker activity (VAD) loss ────────────────────────
@@ -1482,7 +1482,7 @@ def train_one_epoch(
             try:
                 vad_loss = vad_loss_fn(tse_out, vad_segments, mix_lens, mixture)
             except Exception as e:
-                logger.warning(f"[Train] VAD loss 计算失败: {e}")
+                logger.warning(f"[Train] VAD loss failed: {e}")
                 vad_loss = torch.tensor(0.0, device=device)
 
         # ── 3.6. Differentiable DNSMOS loss ────────────────────────────────
@@ -1491,7 +1491,7 @@ def train_one_epoch(
             try:
                 dnsmos_loss = dnsmos_loss_fn(inf=tse_out).mean()
             except Exception as e:
-                logger.warning(f"[Train] DNSMOS loss 计算失败: {e}")
+                logger.warning(f"[Train] DNSMOS loss failed: {e}")
                 dnsmos_loss = torch.tensor(0.0, device=device)
 
         # ── 4. Combine losses ──────────────────────────────────────────────
@@ -1508,7 +1508,7 @@ def train_one_epoch(
         # Same for non-finite losses: if any rank has one, all ranks skip backward
         if not all_ranks_ok(bool(torch.isfinite(loss)), device):
             if is_main:
-                logger.warning(f"[Train] step={global_step} loss 非有限值，跳过")
+                logger.warning(f"[Train] step={global_step} loss is not finite, skipping")
             optimizer.zero_grad()
             global_step += 1
             scheduler.step()
@@ -1627,7 +1627,7 @@ def train_one_epoch(
                 latest.unlink()
             latest.symlink_to(ckpt_path.name)
             rotate_checkpoints(str(model_dir), max_keep_ckpts)
-            logger.info(f"[Ckpt] 保存 step={global_step}: {ckpt_path.name}")
+            logger.info(f"[Ckpt] saved step={global_step}: {ckpt_path.name}")
 
     # No valid batches -> inf, so the epoch is never picked as best
     epoch_loss = epoch_loss_sum / epoch_batches if epoch_batches > 0 else float("inf")
@@ -1722,7 +1722,7 @@ def launch_async_epoch_eval(
         prev_log = state.get("log_path")
         if skip_if_running:
             logger.info(
-                f"[Eval] 跳过 epoch={epoch}：上一轮后台评估仍在运行 "
+                f"[Eval] skipping epoch={epoch}: previous background evaluation still running "
                 f"(epoch={prev_epoch}, pid={prev_proc.pid}, log={prev_log})"
             )
             return state
@@ -1769,11 +1769,11 @@ fi
         start_new_session=True,
     )
     logger.info(
-        f"[Eval] 后台启动 epoch={epoch} 评估, pid={proc.pid}, "
+        f"[Eval] started background evaluation for epoch={epoch}, pid={proc.pid}, "
         f"output_dir={output_dir}, log={log_path}"
     )
     logger.info(
-        f"[Eval] 本轮完成后会归档 summary 到: {eval_summaries_dir}"
+        f"[Eval] the summary will be archived to: {eval_summaries_dir}"
     )
     return {
         "proc": proc,
@@ -1874,21 +1874,21 @@ def resolve_spk_encoder_paths(cfg: Dict) -> Dict[str, str]:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="TSE-ASR 端到端训练（支持单卡/多卡 DDP）")
+    parser = argparse.ArgumentParser(description="TSE-ASR end-to-end training (single GPU / multi-GPU DDP)")
     parser.add_argument(
         "--config", "-c",
         type=str, required=True,
-        help="训练配置文件路径（YAML）",
+        help="Training config file (YAML)",
     )
     parser.add_argument(
         "--resume",
         type=str, default=None,
-        help="从该 checkpoint 文件恢复训练（覆盖 config 中的 resume）",
+        help="Resume training from this checkpoint (overrides resume in the config)",
     )
     parser.add_argument(
         "--exp_dir",
         type=str, default=None,
-        help="实验目录（覆盖 config 中的 exp_dir）",
+        help="Experiment directory (overrides exp_dir in the config)",
     )
     parser.add_argument(
         "--pretrained_tse",
@@ -1898,7 +1898,7 @@ def main():
     parser.add_argument(
         "--max_samples",
         type=int, default=None,
-        help="最大训练样本数（覆盖 config）",
+        help="Maximum number of training samples (overrides the config)",
     )
     args = parser.parse_args()
 
@@ -1961,15 +1961,15 @@ def main():
 
     amp_dtype = parse_amp_dtype(cfg.get("amp_dtype", "float32"))   # fail fast on typos
     if is_main:
-        logger.info(f"实验目录: {exp_dir_abs}")
+        logger.info(f"Experiment dir: {exp_dir_abs}")
         if cfg.get("enable_amp", False) and amp_dtype is None:
             logger.warning("enable_amp is true but amp_dtype is float32; training in full float32")
         logger.info(
             f"Precision: "
             f"{amp_dtype if cfg.get('enable_amp', False) and amp_dtype is not None else 'float32 (AMP off)'}"
         )
-        logger.info(f"配置文件: {args.config}")
-        logger.info(f"多卡训练: world_size={world_size}")
+        logger.info(f"Config file: {args.config}")
+        logger.info(f"Distributed training: world_size={world_size}")
 
         config_save_path = Path(exp_dir_abs) / "config.yaml"
         if not config_save_path.exists():
@@ -1988,7 +1988,7 @@ def main():
     else:
         device = torch.device("cpu")
     if is_main:
-        logger.info(f"rank={rank} 使用设备: {device}，world_size={world_size}")
+        logger.info(f"rank={rank} device: {device}, world_size={world_size}")
 
     # ── Dataset ───────────────────────────────────────────────────────────
     data_cfg = cfg["data"]
@@ -2002,14 +2002,14 @@ def main():
         # Backward compatibility with the old train_root (single string)
         _root_single = data_cfg.get("train_root", None)
         if _root_single is None:
-            raise ValueError("[Data] 配置中必须指定 train_roots 或 train_root")
+            raise ValueError("[Data] the config must set train_roots or train_root")
         _roots_raw = [_root_single]
     elif isinstance(_roots_raw, str):
         _roots_raw = [_roots_raw]
 
     train_roots = [resolve_path(r, _SCRIPT_DIR) for r in _roots_raw]
     if is_main:
-        logger.info(f"[Data] 训练数据根目录: {train_roots}")
+        logger.info(f"[Data] training data roots: {train_roots}")
 
     train_dataset = TSEASRDataset(
         train_roots        = train_roots,
@@ -2022,6 +2022,12 @@ def main():
         max_samples        = data_cfg.get("max_samples", 0),
         peak_normalize     = data_cfg.get("peak_normalize", True),
     )
+    if len(train_dataset) == 0:
+        raise ValueError(
+            f"[Data] no training samples found under train_roots={train_roots} for datasets="
+            f"{data_cfg.get('datasets')}; check data.train_roots in {args.config} "
+            f"(the warnings above list the missing files)"
+        )
 
     # DDP: DistributedSampler replaces shuffle=True
     sampler = (
@@ -2040,7 +2046,7 @@ def main():
         pin_memory  = True,
     )
     if is_main:
-        logger.info(f"DataLoader: {len(train_dataset)} 条样本，{len(dataloader)} 个 batch/epoch/rank")
+        logger.info(f"DataLoader: {len(train_dataset)} samples, {len(dataloader)} batches/epoch/rank")
 
     # ── TSE model ─────────────────────────────────────────────────────────
     _DEFAULT_TSE = "/home/yuque3/nwy/real-t/REAL-TSE-Challenge/pretrained/bsrnn_ecapa_vox1/avg_model.pt"
@@ -2064,7 +2070,7 @@ def main():
         _m = tse_model.module if world_size > 1 else tse_model
         n_params = sum(p.numel() for p in _m.parameters())
         n_train  = sum(p.numel() for p in _m.parameters() if p.requires_grad)
-        logger.info(f"TSE 模型参数: 总量={n_params/1e6:.2f}M，可训练={n_train/1e6:.2f}M")
+        logger.info(f"TSE model parameters: total={n_params/1e6:.2f}M, trainable={n_train/1e6:.2f}M")
 
     # ── Resolve loss_mode (decided once, here in main) ────────────────────
     loss_mode = cfg.get("loss_mode", "combined")
@@ -2073,7 +2079,7 @@ def main():
         loss_mode = "combined"
     valid_modes = ("ce", "similarity", "combined")
     if loss_mode not in valid_modes:
-        raise ValueError(f"无效 loss_mode={loss_mode!r}，合法值: {valid_modes}")
+        raise ValueError(f"invalid loss_mode={loss_mode!r}, valid values: {valid_modes}")
     if is_main:
         logger.info(f"[Loss] loss_mode={loss_mode}")
 
@@ -2088,10 +2094,10 @@ def main():
         asr_model = asr_model.to(device)
         asr_model.check_languages(train_dataset.languages())
         if is_main:
-            logger.info(f"[ASR] Whisper 已加载: {whisper_path}")
+            logger.info(f"[ASR] Whisper loaded: {whisper_path}")
     else:
         if is_main:
-            logger.info("[ASR] loss_mode=similarity，跳过 Whisper 加载")
+            logger.info("[ASR] loss_mode=similarity, not loading Whisper")
 
     # ── Speaker similarity loss (loaded only for similarity / combined) ──
     # One encoder per language, matching the evaluation side
@@ -2114,7 +2120,7 @@ def main():
         spk_loss_fn = SpeakerSimilarityLoss(encoders=encoders, margin=margin)
         if is_main:
             logger.info(
-                f"[Loss] 启用说话人相似度 Ranking Loss: margin={margin}, encoders="
+                f"[Loss] speaker similarity ranking loss enabled: margin={margin}, encoders="
                 + ", ".join(f"{l}={p}" for l, p in encoder_paths.items())
             )
 
@@ -2133,7 +2139,7 @@ def main():
         )
         if is_main:
             logger.info(
-                f"[Loss] 启用目标说话人活动检测 Loss: "
+                f"[Loss] target speaker VAD loss enabled: "
                 f"lambda_vad={lambda_vad}, "
                 f"frame_shift={vad_frame_shift_ms}ms, "
                 f"frame_length={vad_frame_length_ms}ms, "
@@ -2146,8 +2152,7 @@ def main():
     if loss_mode == "combined" and lambda_dnsmos > 0:
         if not _DNSMOS_LOSS_AVAILABLE:
             logger.warning(
-                "[Loss] DNSMOSLoss 不可用（wesep.utils.speech_quality_losses 导入失败），"
-                "跳过 DNSMOS Loss。请确认 wesep_real_tse 路径正确且 onnx2torch 已安装。"
+                "[Loss] DNSMOSLoss is unavailable, skipping the DNSMOS loss."
             )
         else:
             import os as _os
@@ -2166,12 +2171,12 @@ def main():
                 dnsmos_loss_fn = dnsmos_loss_fn.to(device)
                 if is_main:
                     logger.info(
-                        f"[Loss] 启用可微分 DNSMOS Loss: "
+                        f"[Loss] differentiable DNSMOS loss enabled: "
                         f"target={_target}, lambda_dnsmos={lambda_dnsmos}, "
                         f"model_dir={_dnsmos_dir}"
                     )
             except Exception as e:
-                logger.warning(f"[Loss] DNSMOSLoss 初始化失败，跳过: {e}")
+                logger.warning(f"[Loss] DNSMOSLoss initialization failed, skipping: {e}")
                 dnsmos_loss_fn = None
 
     # ── Optimizer ─────────────────────────────────────────────────────────
@@ -2182,7 +2187,7 @@ def main():
         weight_decay = opt_cfg.get("weight_decay", 1e-5),
     )
     if is_main:
-        logger.info(f"优化器: AdamW, lr={opt_cfg.get('lr', 1e-5):.1e}")
+        logger.info(f"Optimizer: AdamW, lr={opt_cfg.get('lr', 1e-5):.1e}")
 
     # ── Learning-rate scheduler ───────────────────────────────────────────
     sch_cfg    = cfg.get("scheduler_args", {})
@@ -2200,7 +2205,7 @@ def main():
     )
     if is_main:
         logger.info(
-            f"调度器: ExponentialDecay, "
+            f"Scheduler: ExponentialDecay, "
             f"lr: {sch_cfg.get('initial_lr', 1e-5):.1e} -> {sch_cfg.get('final_lr', 1e-6):.1e}"
         )
 
@@ -2222,9 +2227,9 @@ def main():
     cfg["_best_loss"] = best_loss
     eval_state: Dict = {}
     if is_main:
-        logger.info(f"开始训练: epoch={start_epoch}..{num_epochs}, step={global_step}, world_size={world_size}")
+        logger.info(f"Starting training: epoch={start_epoch}..{num_epochs}, step={global_step}, world_size={world_size}")
         logger.info(
-            "[Eval] epoch 后台评估已启用: "
+            "[Eval] per-epoch background evaluation enabled: "
             f"test_set={str(cfg.get('epoch_eval_test_set', 'DEV')).upper()}, "
             f"cuda={cfg.get('epoch_eval_cuda', '2')}, "
             f"fast={bool(cfg.get('epoch_eval_fast', True))}, "
@@ -2311,7 +2316,7 @@ def main():
     if writer is not None:
         writer.close()
     if is_main:
-        logger.info("训练完成！")
+        logger.info("Training finished!")
 
     cleanup_ddp()
 
